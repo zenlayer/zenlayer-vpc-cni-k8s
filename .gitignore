@@ -1,0 +1,53 @@
+# Build output (Makefile OUTPUT / CHART_OUTPUT)
+/output/
+output/
+
+# Go build & test artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+coverage.txt
+coverage.html
+/vendor/
+/zec-cni
+/zec-ipam
+
+# Helm packaging artifacts
+*.tgz
+*.tar.gz
+chart/charts/
+chart/Chart.lock
+chart/*.tgz
+
+# Local / rendered manifests
+*.local.yaml
+*.rendered.yaml
+
+# Editors & IDEs
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.project
+*.tmproj
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# Local tool state
+.claude/settings.local.json
+.tmp
+CLAUDE.md

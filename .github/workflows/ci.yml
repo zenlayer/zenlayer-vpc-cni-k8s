@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Everything in this repo is built for Linux; the Makefile does the same.
+  GOOS: linux
+  CGO_ENABLED: "0"
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check gofmt
+        run: |
+          # rpc/ holds generated protobuf stubs; leave them alone.
+          files="$(gofmt -l $(find . -name '*.go' -not -path './rpc/*'))"
+          if [ -n "$files" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$files"
+            exit 1
+          fi
+
+      - name: go mod tidy is up to date
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      # The Makefile has carried this target since the version drift it was
+      # written for, but nothing ran it: no target depended on it and CI did
+      # not call it, so the check it describes was never actually enforced.
+      - name: Versions agree across CHANGELOG and Chart.yaml
+        run: make version-check
+
+      # addlicense only adds a header where one is missing, so this check answers
+      # "does every hand-written source file carry the SPDX header" and never
+      # objects to the year on a file that already has one.
+      - name: License headers present
+        run: make license-check
+
+      - name: Build binaries
+        run: |
+          go build -o /tmp/zec-cni ./cmd/zenlayer-vpc-cni
+          go build -o /tmp/zec-ipam ./cmd/cni-ipam
+
+      - name: Test
+        # GOOS is linux for the whole job, matching the runner, so tests run
+        # natively. -race needs cgo, hence the local CGO_ENABLED override.
+        run: CGO_ENABLED=1 go test -race -count=1 ./...
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          # Must be a golangci-lint v2.x release: .golangci.yml uses the v2 schema.
+          version: v2.12.2
+          args: --timeout=10m
+
+  chart:
+    name: Helm chart
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      # The same required values the Makefile's chart-lint / chart-template
+      # targets use, so the `required`/`fail` guards do not mask template errors.
+      - name: helm lint
+        run: |
+          helm lint chart \
+            --set zec.vpcID=vpc-test \
+            --set zec.subnetIDs={subnet-test} \
+            --set zec.securityGroupID=sg-test
+
+      - name: helm template
+        run: |
+          helm template zenlayer-vpc-cni chart \
+            --set zec.vpcID=vpc-test \
+            --set zec.subnetIDs={subnet-test} \
+            --set zec.securityGroupID=sg-test

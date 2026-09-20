@@ -1,0 +1,134 @@
+// Copyright 2026 The Zenlayer Authors
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+package rpc;
+option go_package = "./;rpc";
+
+service CNIIpam {
+  rpc AllocIP (AllocIPRequest) returns (AllocIPResponse) {
+  }
+  rpc ReleaseIP (ReleaseIPRequest) returns (ReleaseIPResponse) {
+  }
+  rpc GetIPInfo(GetIPInfoRequest) returns (GetIPInfoResponse) {
+  }
+  rpc RecordEvent(RecordEventRequest) returns (RecordEventResponse) {
+  }
+}
+
+message AllocIPRequest {
+  string K8SPodName = 1;
+  string K8SPodNamespace = 2;
+  string K8SPodInfraContainerId = 3;
+  string Netns = 4;
+  string IfName = 5;
+}
+
+message IPSet {
+  string IPv4 = 1;
+  string IPv6 = 2;
+}
+
+enum IPType {
+  TypeENIMultiIP = 0;
+}
+
+message AllocIPResponse {
+  ErrorCode Code = 1;
+  IPType   IPType = 2;
+  repeated NetConf NetConfs = 3;
+}
+
+message Route {
+  string Dst = 1;
+}
+
+message ENIInfo {
+  string ID = 1;
+  string MAC = 2;
+  string GatewayMac = 3;
+  IPSet GatewayIP = 4;
+  IPSet Subnet = 5; // subnet cidr
+  // PrimaryIP is this interface's own primary address, the one the platform
+  // bound to this port's MAC. The datapath needs it to give the interface a
+  // source address the fabric will accept; see eniAddrs.
+  IPSet PrimaryIP = 6;
+  // IsPrimary marks the instance's own interface. The datapath must never
+  // configure addresses on it: it already carries the node's, and replacing
+  // those takes the node off the network. See eniAddrs.
+  bool IsPrimary = 7;
+}
+
+message NetConf {
+  ENIInfo ENIInfo = 1;
+  string IfName = 2;
+  IPSet PodIP = 3;
+  IPSet ServiceCIDR = 4;
+  repeated Route ExtraRoutes = 5;
+  bool DefaultRoute = 6;
+}
+
+message ReleaseIPRequest {
+  string K8SPodName = 1;
+  string K8SPodNamespace = 2;
+  string K8SPodInfraContainerId = 3;
+}
+
+message ReleaseIPResponse {
+  ErrorCode Code = 1;
+}
+
+
+message GetIPInfoRequest {
+  string K8SPodName = 1;
+  string K8SPodNamespace = 2;
+  string K8SPodInfraContainerId = 3;
+}
+
+message GetIPInfoResponse {
+  ErrorCode Code = 1;
+  IPType   IPType = 2;
+  bool IPv4 = 3;
+  bool IPv6 = 4;
+  repeated NetConf NetConfs = 5;
+}
+
+enum EventTarget {
+  EventTargetNode = 0;
+  EventTargetPod = 1;
+}
+
+enum EventType {
+  EventTypeNormal = 0;
+  EventTypeWarning = 1;
+}
+
+message RecordEventRequest {
+  EventTarget EventTarget = 1;
+  string K8SPodName = 2;
+  string K8SPodNamespace = 3;
+  EventType EventType = 4;
+  string Reason = 5;
+  string Message = 6;
+}
+
+message RecordEventResponse {
+  ErrorCode Code = 1;
+}
+
+enum ErrorCode {
+	Success = 0;
+ 
+  PodNotFound  = 1001;
+  NetworkModeNotSupport= 1002;
+  ConflictRequest= 1003;
+
+	AllocIPFailure = 1004;
+	ReleaseIPFailure = 1005;
+
+	K8SAPIError = 1006;
+	WriteDBError = 1007;
+	ReadDBError = 1008;
+  CRDNotFound  = 1009;
+}
+ 

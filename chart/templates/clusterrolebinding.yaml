@@ -1,0 +1,12 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: zenlayer-vpc-cni-plugin
+subjects:
+  - kind: ServiceAccount
+    name: zenlayer-vpc-cni-plugin
+    namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: zenlayer-vpc-cni-plugin

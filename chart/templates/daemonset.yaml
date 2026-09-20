@@ -1,0 +1,220 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app: zenlayer-vpc-cni
+  name: zenlayer-vpc-cni
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: zenlayer-vpc-cni
+  template:
+    metadata:
+      labels:
+        app: zenlayer-vpc-cni
+      annotations:
+        # The daemon reads eni_conf once at startup, so a ConfigMap-only change
+        # would otherwise not take effect until the pod happens to restart.
+        checksum/config: {{ include (print $.Template.BasePath "/zeccni-configmap.yaml") . | sha256sum }}
+    spec:
+      tolerations:
+        - operator: "Exists"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/os
+                    operator: In
+                    values:
+                      - linux
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values:
+                      - amd64
+      serviceAccountName: zenlayer-vpc-cni-plugin
+      hostNetwork: true
+      hostPID: true
+      priorityClassName: "system-node-critical"
+      restartPolicy: Always
+      initContainers:
+        # Loads kernel modules and installs the zec-cni binary, the loopback
+        # plugin and the CNI conflist onto the host (script/bootstrap/install_env.sh).
+        - name: zec-cni-init
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            privileged: true
+          command: [ "/bin/bash", "-c", "/script/install_env.sh" ]
+          volumeMounts:
+            - mountPath: /opt/cni/bin/
+              name: host-cni-bin-dir
+            - mountPath: /lib/modules
+              name: host-lib-modules
+            - mountPath: /etc/sysctl.d
+              name: host-sysctl-d
+      containers:
+        # zec-ipam: the per-node IPAM daemon.
+        - name: zec-ipam
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [ "zec-ipam" ]
+          env:
+            {{- if .Values.zec.k8sServiceHost }}
+            - name: KUBERNETES_SERVICE_HOST
+              value: {{ .Values.zec.k8sServiceHost | quote }}
+            {{- end }}
+            {{- if .Values.zec.k8sServicePort }}
+            - name: KUBERNETES_SERVICE_PORT
+              value: {{ .Values.zec.k8sServicePort | quote }}
+            {{- end }}
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- if .Values.zec.logLevel }}
+            - name: ZENLAYER_CNI_LOGLEVEL
+              value: {{ .Values.zec.logLevel | quote }}
+            {{- end }}
+            {{- if and .Values.cilium.enabled .Values.cilium.waitTimeout }}
+            - name: ZENLAYER_CNI_CILIUM_WAIT_TIMEOUT
+              value: {{ .Values.cilium.waitTimeout | quote }}
+            {{- end }}
+          # /healthz is served by the daemon's debug server, which only starts
+          # after NewIpamDaemon has finished talking to the OpenAPI and set up
+          # the ENI pool -- hence the generous startup allowance.
+          startupProbe:
+            httpGet:
+              host: 127.0.0.1
+              path: /healthz
+              port: {{ .Values.zec.healthAndDebugPort }}
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              host: 127.0.0.1
+              path: /healthz
+              port: {{ .Values.zec.healthAndDebugPort }}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              host: 127.0.0.1
+              path: /healthz
+              port: {{ .Values.zec.healthAndDebugPort }}
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            privileged: true
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            # gRPC socket the daemon listens on (zec-cni dials it).
+            - mountPath: /var/run/zenlayer
+              name: host-run-zenlayer
+            # File lock directory used by the daemon.
+            - mountPath: /var/run/eni
+              name: host-run-eni
+            - mountPath: /var/run/netns
+              name: host-run-netns
+              mountPropagation: HostToContainer
+            - mountPath: /opt/cni/bin
+              name: host-cni-bin-dir
+            # Host /etc/cni/net.d, written to by the daemon's ensure CNI Config.
+            - mountPath: /host-etc-net.d
+              name: host-cni-conf-dir
+            - mountPath: /var/log/zenlayer
+              name: host-log-zenlayer
+            # The daemon's BoltDB resource record lives at /var/lib/cni/zenlayer/Resource.db.
+            - mountPath: /var/lib/cni
+              name: host-cni-db
+            - mountPath: /var/lib/kubelet/device-plugins
+              name: host-device-plugins
+            # CNI conflist the daemon reads before copying to the host.
+            - mountPath: /etc/cni/net.d/10-zenlayer-cni.conflist
+              name: configvolume
+              subPath: 10-zenlayer-cni.conflist
+            # Zenlayer OpenAPI credentials, read as files by the daemon.
+            - mountPath: /etc/zec_secret/
+              name: zec-secret
+              readOnly: true
+            {{- if .Values.cilium.enabled }}
+            # The cilium agent's API socket lives here. The daemon dials it
+            # before publishing the conflist, because the conflist chains
+            # cilium-cni and that plugin cannot do an ADD without the agent.
+            # Not readOnly: connecting to a unix socket needs write access.
+            - mountPath: /var/run/cilium
+              name: host-run-cilium
+            {{- end }}
+      volumes:
+        - name: zec-secret
+          secret:
+            secretName: {{ .Values.zec.secretName }}
+            defaultMode: 0400
+        - name: configvolume
+          configMap:
+            name: zenlayer-cni-config
+            items:
+              - key: 10-zenlayer-cni.conflist
+                path: 10-zenlayer-cni.conflist
+        - name: host-cni-bin-dir
+          hostPath:
+            path: /opt/cni/bin/
+            type: DirectoryOrCreate
+        - name: host-cni-conf-dir
+          hostPath:
+            path: /etc/cni/net.d/
+            type: DirectoryOrCreate
+        - name: host-run-zenlayer
+          hostPath:
+            path: /var/run/zenlayer
+            type: DirectoryOrCreate
+        - name: host-run-eni
+          hostPath:
+            path: /var/run/eni
+            type: DirectoryOrCreate
+        {{- if .Values.cilium.enabled }}
+        # DirectoryOrCreate, not Directory: the daemon may land on a node
+        # before the cilium agent has ever run. An empty directory makes the
+        # wait report "agent not up yet", which is the truth; a missing mount
+        # would fail the pod for the wrong reason.
+        - name: host-run-cilium
+          hostPath:
+            path: /var/run/cilium
+            type: DirectoryOrCreate
+        {{- end }}
+        - name: host-run-netns
+          hostPath:
+            path: /var/run/netns
+            type: DirectoryOrCreate
+        - name: host-log-zenlayer
+          hostPath:
+            path: /var/log/zenlayer
+            type: DirectoryOrCreate
+        - name: host-cni-db
+          hostPath:
+            path: /var/lib/cni
+            type: DirectoryOrCreate
+        - name: host-device-plugins
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: Directory
+        - name: host-lib-modules
+          hostPath:
+            path: /lib/modules
+        # The init container drops 99-zenlayer-vpc-cni.conf here so the host's
+        # own systemd-sysctl stops resetting rp_filter on the pod veths. Scoped
+        # to eni* -- the host's baseline for every other interface is untouched.
+        # DirectoryOrCreate rather than Directory: a host without /etc/sysctl.d
+        # should still get a working CNI, and install_env.sh skips the drop-in
+        # rather than failing.
+        - name: host-sysctl-d
+          hostPath:
+            path: /etc/sysctl.d
+            type: DirectoryOrCreate

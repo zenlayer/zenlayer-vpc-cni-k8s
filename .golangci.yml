@@ -1,0 +1,89 @@
+# golangci-lint configuration (schema v2).
+# Run locally with: golangci-lint run
+version: "2"
+
+run:
+  # Match the toolchain declared in go.mod.
+  go: "1.25"
+  timeout: 10m
+  # The code targets Linux only (GOOS=linux in every Makefile build target),
+  # so lint it the way it is built.
+  build-tags: []
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - misspell
+    - staticcheck
+    - unused
+
+  settings:
+    govet:
+      enable:
+        - printf
+      enable-all: false
+    errcheck:
+      check-type-assertions: true
+      check-blank: false
+    misspell:
+      locale: US
+    staticcheck:
+      checks:
+        - all
+
+  exclusions:
+    generated: lax
+    presets:
+      - std-error-handling
+    paths:
+      # Generated protobuf / gRPC stubs.
+      - rpc/
+    rules:
+      # Test helpers routinely ignore errors that matter in production code.
+      - path: _test\.go
+        linters:
+          - errcheck
+      # The three entries below are a backlog, not a policy. They are excluded by
+      # name rather than through the built-in "comments" preset so that each one
+      # stays visible next to `staticcheck.checks: [all]` above, instead of
+      # silently contradicting it. Delete an entry once its class is clean.
+      #
+      # ST1000 / ST102x -- doc comments. Packages that carry a fact worth stating
+      # have a package comment; the rest deliberately do not, and most exported
+      # identifiers still have no doc comment.
+      - linters:
+          - staticcheck
+        text: "^ST1000:"
+      - linters:
+          - staticcheck
+        text: "^ST102[012]:"
+      # ST1003 -- initialisms and ALL_CAPS in names (Id/Ip/Api/Rpc, and the
+      # platform error-code constants). 115 hits, every one a rename of an
+      # identifier rather than a change in behaviour, and they land in the same
+      # place as the `EC2` naming question: both rewrite names across the API
+      # surface of pkg/zapi. Deferred until that is decided, so the two happen
+      # once instead of twice. Values are not in scope either way -- "eniIp" is
+      # the on-disk record type, GATEWAY_MAC's value goes on the wire, and the
+      # ALL_CAPS constants hold codes the platform defines.
+      - linters:
+          - staticcheck
+        text: "^ST1003:"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/zenlayer/zenlayer-vpc-cni-k8s
+  exclusions:
+    generated: lax
+    paths:
+      - rpc/
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

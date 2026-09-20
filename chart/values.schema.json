@@ -1,0 +1,237 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "zenlayer-vpc-cni values",
+  "type": "object",
+  "required": [
+    "image",
+    "zec",
+    "resources"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "global": {
+      "type": "object",
+      "description": "Values injected by a parent chart when this chart is used as a subchart. Declared so that the strict additionalProperties check above does not reject Helm's own injection; nothing in this chart reads it."
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "tag"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pullPolicy": {
+          "enum": [
+            "Always",
+            "IfNotPresent",
+            "Never"
+          ]
+        }
+      }
+    },
+    "zec": {
+      "type": "object",
+      "required": [
+        "vpcID",
+        "subnetIDs",
+        "securityGroupID",
+        "secretName"
+      ],
+      "properties": {
+        "vpcID": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Zenlayer VPC ID. All subnets must belong to it."
+        },
+        "subnetIDs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "maxItems": 5,
+          "description": "Subnets pods draw secondary IPs from. The daemon rejects more than 5 (config.MaxSubnetNum)."
+        },
+        "securityGroupID": {
+          "type": "string",
+          "minLength": 1
+        },
+        "secretName": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Secret holding AccessKeyID / AccessKeyPassword. Created out of band, never templated."
+        },
+        "openAPIDomain": {
+          "type": "string"
+        },
+        "dataPath": {
+          "enum": [
+            "veth"
+          ],
+          "description": "veth pair + per-ENI policy routing. The only supported datapath. Any other value is refused here at install time, and by the CNI plugin on every ADD; the daemon does not read this field."
+        },
+        "networkMode": {
+          "enum": [
+            "eni_multi_ip"
+          ],
+          "description": "Only ENI multi-IP is implemented."
+        },
+        "ipStack": {
+          "enum": [
+            "ipv4",
+            "dual"
+          ],
+          "description": "Address families given to pods. \"dual\" requires every subnet in zec.subnetIDs to carry both an IPv4 and an IPv6 CIDR; the daemon refuses to start otherwise rather than quietly serving only one family. IPv6-only is rejected by the daemon with a message saying so -- the code paths are family-generic but capacity reporting, the service CIDR lookup and new-ENI address stripping are not finished for it."
+        },
+        "ipv6InternetChargeType": {
+          "enum": [
+            "ByTrafficPackage",
+            "ByBandwidth",
+            "BandwidthCluster"
+          ],
+          "description": "How the platform bills public IPv6 on an interface, used only when ipStack is \"dual\". The platform refuses to enable IPv6 on an interface without this when the subnet's ipv6Type is Public, which every dual-stack subnet seen so far is -- and since the daemon enables IPv6 on each interface it creates, this setting decides what the cluster is billed for. Ignored on a Private-IPv6 subnet. ByTrafficPackage also needs ipv6PackageSize; BandwidthCluster also needs ipv6ClusterId."
+        },
+        "ipv6Bandwidth": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Public IPv6 cap in Mbps per interface, used only when ipStack is \"dual\". Bounds what a single runaway pod can spend."
+        },
+        "ipv6PackageSize": {
+          "type": "number",
+          "minimum": 0,
+          "multipleOf": 0.1,
+          "description": "Traffic package size in TB, required by the platform when ipv6InternetChargeType is \"ByTrafficPackage\". Must be 0 or a multiple of 0.1."
+        },
+        "ipv6ClusterId": {
+          "type": "string",
+          "description": "Shared bandwidth package to join, required by the platform when ipv6InternetChargeType is \"BandwidthCluster\"."
+        },
+        "serviceCidr": {
+          "type": "string",
+          "description": "Service CIDR(s), comma-separated. Empty means the daemon reads it from kube-system/kubeadm-config, which only works on kubeadm clusters -- set it explicitly elsewhere or the daemon will not start. Nothing in the datapath acts on it: service traffic already traverses the host stack."
+        },
+        "poolTarget": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "poolTargetMin": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "poolTargetMax": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "poolTargetCapProbe": {
+          "type": "boolean"
+        },
+        "reconcileIntervalSec": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "poolMonitorIntervalSec": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "healthAndDebugPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "logLevel": {
+          "enum": [
+            "",
+            "trace",
+            "debug",
+            "info",
+            "warn",
+            "error",
+            "fatal",
+            "panic"
+          ],
+          "description": "Empty keeps the built-in default (info). Drives ZENLAYER_CNI_LOGLEVEL on the DaemonSet and, for debug, the conflist debug flag zec-cni reads."
+        },
+        "k8sServiceHost": {
+          "type": "string"
+        },
+        "k8sServicePort": {
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "manageUntaggedENI": {
+          "type": "boolean",
+          "description": "Adopt secondary interfaces attached to the node that this plugin did not create and that carry no zenlayer:cni:no-manage tag. Default true. When false such interfaces are left alone but still consume the instance's interface quota."
+        }
+      },
+      "additionalProperties": false
+    },
+    "cni": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "chained",
+            "delegated"
+          ],
+          "description": "Which plugin owns the pod device. \"chained\": this plugin creates it and Cilium is chained after. \"delegated\": Cilium creates it and this plugin only does IPAM plus host routing; requires cilium.enabled=true."
+        }
+      },
+      "additionalProperties": false
+    },
+    "cilium": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Chain cilium-cni after this plugin (generic-veth chaining). Does not install Cilium; deploy it from its own chart -- see docs/deploy-cilium-chained.md."
+        },
+        "waitTimeout": {
+          "type": "string",
+          "description": "How long the daemon waits for the cilium agent socket before restarting. Go duration syntax; empty keeps the 5m default."
+        }
+      },
+      "additionalProperties": false
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Require NetworkPolicy to be enforced. Off means policy objects exist but nothing acts on them. On requires the provider to be enabled -- with cilium that means cilium.enabled=true."
+        },
+        "provider": {
+          "enum": [
+            "cilium"
+          ],
+          "description": "Engine expected to enforce policy. Only cilium."
+        }
+      },
+      "additionalProperties": false
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requests": {
+          "type": "object"
+        },
+        "limits": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}

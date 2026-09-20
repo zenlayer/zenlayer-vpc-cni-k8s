@@ -1,0 +1,29 @@
+# The image builds from source inside the builder stage (see images/Dockerfile),
+# so nothing prebuilt needs to enter the context. Keeping output/ out matters:
+# a debug build of zec-ipam alone is ~90MB.
+output/
+*.tgz
+*.tar.gz
+
+.git/
+.gitignore
+.github/
+
+# Chart and docs play no part in the image
+chart/
+docs/
+*.md
+LICENSE
+
+# Local tooling and editor state
+.claude/
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*~
+
+# Test and coverage artifacts
+*.test
+*.out
+coverage.*

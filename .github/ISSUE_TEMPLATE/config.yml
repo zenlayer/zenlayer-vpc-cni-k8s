@@ -1,0 +1,13 @@
+# blank_issues_enabled: false is the point of this file. Without it GitHub keeps
+# the "open a blank issue" escape hatch next to the templates, and a blank issue
+# is exactly where a security report lands -- the warning against that lives
+# inside the bug-report template, which a blank issue never shows.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/zenlayer/zenlayer-vpc-cni-k8s/security/advisories/new
+    about: Do not open a public issue. Use private vulnerability reporting, or email security@zenlayer.com with zenlayer-vpc-cni in the subject. See SECURITY.md.
+  - name: Deploying with Cilium chaining
+    url: https://github.com/zenlayer/zenlayer-vpc-cni-k8s/blob/main/docs/deploy-cilium-chained.md
+    about: Every Cilium value that must be set and why, verification steps, and how to switch chaining on or off. Read this before filing a NetworkPolicy issue.

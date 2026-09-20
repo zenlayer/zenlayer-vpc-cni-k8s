@@ -1,0 +1,27 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: zenlayer-vpc-cni-plugin
+rules:
+  # GetLocalNode / NewK8sService read the node the daemon runs on.
+  - apiGroups: [ "" ]
+    resources: [ "nodes" ]
+    verbs: [ "get", "list", "watch" ]
+  # Pod informer (field-selected to this node), ListLocalPods, GetPod, and the
+  # annotation patch in PatchPodAnnotation.
+  - apiGroups: [ "" ]
+    resources: [ "pods" ]
+    verbs: [ "get", "list", "watch", "patch" ]
+  # EvictPod (policy/v1 Eviction) when a node runs out of ENI-IP capacity.
+  - apiGroups: [ "" ]
+    resources: [ "pods/eviction" ]
+    verbs: [ "create" ]
+  # eni_conf is read from the zenlayer-cni-config ConfigMap; serviceCidr falls
+  # back to kube-system/kubeadm-config. A ConfigMap informer watches for changes.
+  - apiGroups: [ "" ]
+    resources: [ "configmaps" ]
+    verbs: [ "get", "list", "watch" ]
+  # Node and pod events recorded through the EventBroadcaster sink.
+  - apiGroups: [ "" ]
+    resources: [ "events" ]
+    verbs: [ "create", "patch", "update" ]

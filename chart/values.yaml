@@ -1,0 +1,197 @@
+image:
+  repository: "docker.io/zenlayer1/zeccni"
+  tag: "v1.0.0"
+  pullPolicy: "Always"
+
+zec:
+  # Zenlayer VPC ID. All subnets below must belong to this VPC.
+  vpcID: ""
+  # IDs of the subnets used by Pods (secondary IPs on ENIs).
+  # At most 5 subnets, all in the same VPC.
+  subnetIDs: []
+  # ID of the security group applied to ENIs created by the daemon.
+  securityGroupID: ""
+  # IP family: "ipv4" or "dual". IPv6-only is declared but rejected by the
+  # daemon; see the schema for what is unfinished.
+  ipStack: "ipv4"
+  # Public IPv6 billing, used only when ipStack is "dual".
+  #
+  # The platform refuses to enable IPv6 on an interface without these when the
+  # subnet's ipv6Type is Public, which every dual-stack subnet seen so far is.
+  # The daemon enables IPv6 on each interface it creates, so it is the daemon
+  # that has to supply them -- which means these settings decide what the
+  # cluster is billed for. Ignored on a Private-IPv6 subnet.
+  #
+  # ByTrafficPackage bills actual use and needs ipv6PackageSize.
+  # ByBandwidth bills the cap. BandwidthCluster joins ipv6ClusterId.
+  ipv6InternetChargeType: "ByTrafficPackage"
+  # Public IPv6 throughput cap in Mbps, applied per network interface -- not per
+  # pod. Every pod whose address sits on the same interface shares this cap, so
+  # a busy pod can starve its neighbours on that interface while pods on the
+  # node's other interfaces are unaffected.
+  ipv6Bandwidth: 10000
+  # Traffic package size in TB, and a multiple of 0.1.
+  #
+  # The 0 below is not a usable value, it is the absence of one. Under
+  # ByTrafficPackage -- the default charge type above -- the daemon refuses to
+  # start until you set a positive size, because a traffic commitment has no safe
+  # default. Under the other charge types this field is ignored, and 0 is then
+  # simply never read.
+  #
+  # If your account is on an hourly billing period the platform rejects
+  # committed package sizes outright; use ipv6InternetChargeType: ByBandwidth
+  # there instead.
+  ipv6PackageSize: 0
+  # Shared bandwidth package to join, required when ipv6InternetChargeType is
+  # BandwidthCluster.
+  ipv6ClusterId: ""
+  # Network mode. Only "eni_multi_ip" (ENI multi-IP) is supported.
+  networkMode: "eni_multi_ip"
+  # Pod datapath, rendered into the conflist as eniip_virtual_type. "veth" is
+  # the only accepted value: a veth pair plus per-ENI policy routing (one route
+  # table per ENI, 1000+ifindex). Pods reach the host stack directly, so
+  # kube-proxy sees both directions of service traffic without help, and it is
+  # the device model Cilium's generic-veth CNI chaining expects.
+  #
+  # Any other value is rejected at install time by this chart's values schema,
+  # and again by the CNI plugin on every ADD, rather than being ignored.
+  #
+  # Note where the second check is: the daemon does not read this field at all.
+  # Editing eniip_virtual_type in the ConfigMap directly, bypassing helm, leaves
+  # the daemon starting normally with every probe green while each pod fails its
+  # CNI ADD and stays in ContainerCreating.
+  dataPath: "veth"
+  # What to do with a secondary network interface that is attached to the node
+  # but was not created by this plugin and carries no
+  # "zenlayer:cni:no-manage" tag.
+  #
+  # true (the default) adopts it, but only if it sits in one of the subnetIDs
+  # above: its secondary addresses join the pod address pool, the plugin
+  # DETACHES AND DELETES it when the pool shrinks, and under ipStack "dual" it
+  # enables IPv6 on it -- a billable operation on a Public-IPv6 subnet.
+  #
+  # false leaves such interfaces untouched. They then still consume the
+  # instance's interface quota, which reduces how many pod addresses the node
+  # can serve.
+  #
+  # Tag any interface attached for another purpose -- storage, management,
+  # monitoring -- with "zenlayer:cni:no-manage=true". The tag is honored
+  # whichever way this setting is left.
+  manageUntaggedENI: true
+  # Service CIDR(s), comma-separated.
+  #
+  # Leave it empty only on a kubeadm cluster. An empty value makes the daemon
+  # read the service subnet from the kube-system/kubeadm-config ConfigMap, and
+  # if that lookup fails the daemon exits with "error retrieving service cidr"
+  # -- so on a cluster kubeadm did not build, this field is required, not
+  # optional.
+  #
+  # Nothing in the datapath acts on the value itself: service traffic already
+  # traverses the host stack, so there is no redirect to install. The daemon
+  # still insists on having an IPv4 service CIDR from one of the two sources. On
+  # a dual-stack cluster a missing IPv6 entry is only logged.
+  serviceCidr: ""
+  # Name of the Secret holding the Zenlayer OpenAPI static credentials.
+  # Create it out of band -- it is deliberately not templated by this chart, so
+  # the credentials never land in values.yaml, git, or the helm release:
+  #   kubectl create secret -n kube-system generic zenlayer-cni-access-key \
+  #     --from-literal=AccessKeyID='<access-key-id>' \
+  #     --from-literal=AccessKeyPassword='<access-key-secret>'
+  secretName: "zenlayer-cni-access-key"
+  # Warm-pool sizing knobs.
+  # poolTarget is how many idle addresses to keep ready; poolTargetMin is a
+  # floor on the pool as a whole, in-use addresses included.
+  #
+  # poolTargetMax caps the pool as a whole, and with poolTargetCapProbe on --
+  # the default -- it is ignored: the cap comes from the instance's real
+  # capacity instead. It only takes effect when probing is turned off, and then
+  # it becomes the capacity this node advertises to the scheduler. The value
+  # below is what the smallest instance can hold: two interfaces of six
+  # addresses each, less the primary address on each, is ten. Turning probing
+  # off on a larger instance without raising this pins the node to ten pods.
+  poolTarget: 2
+  poolTargetMin: 1
+  poolTargetMax: 10
+  poolTargetCapProbe: true
+  # Reconcile / pool-monitor intervals (seconds).
+  reconcileIntervalSec: 1200
+  poolMonitorIntervalSec: 120
+  # Port the daemon serves /healthz and /metrics on. The pod runs
+  # with hostNetwork, so this port is taken on the node itself.
+  healthAndDebugPort: 11414
+  # Log level. Empty keeps the built-in default (info).
+  #
+  # It drives both binaries, which need different mechanisms: zec-ipam reads
+  # the ZENLAYER_CNI_LOGLEVEL env rendered onto the DaemonSet, while zec-cni is
+  # exec'd by kubelet from the host and never sees the pod's env, so "debug"
+  # additionally sets "debug": true in the conflist for it.
+  logLevel: ""
+  # Kubernetes apiserver host/port. Set these when the daemon (hostNetwork)
+  # cannot resolve the in-cluster service, e.g. before kube-proxy is ready.
+  k8sServiceHost: ""
+  k8sServicePort: ""
+
+# Which plugin owns the pod's network device.
+#
+#   chained   -- this plugin creates the device (a veth pair) and wires the pod.
+#                Cilium, if enabled, is chained after it for policy and
+#                observability. This is the supported default.
+#   delegated -- Cilium creates the device and this plugin only supplies
+#                addresses and places the per-ENI host routing. Requires
+#                cilium.enabled=true. See docs/deploy-cilium-netkit.md.
+#
+# The two are per-cluster, not per-node: a node reading one conflist while its
+# neighbours read the other produces pods whose datapath depends on where they
+# landed.
+cni:
+  mode: chained
+
+# Chain upstream Cilium after this plugin.
+#
+# This is the switch that actually changes the datapath wiring: the conflist
+# gains a second plugin that hands the pod to cilium-cni once this plugin has
+# wired it, which is upstream Cilium's generic-veth CNI chaining. The veth pair
+# and the per-ENI policy routing are unchanged.
+#
+# It is deliberately separate from networkPolicy below. Policy is the common
+# reason to want Cilium but not the only one -- Hubble observability needs the
+# agent and no policy at all -- and folding the two together would make
+# "observability without policy" unexpressible.
+#
+# Enabling this does NOT install Cilium. Cilium is deployed separately, from its
+# own upstream chart, and must be running on the node before the conflist goes
+# live -- the daemon blocks until the agent answers, because cilium-cni has no
+# fallback path on ADD. Several of the Cilium values are required rather than
+# recommended; see docs/deploy-cilium-chained.md (Chinese: docs/deploy-cilium-chained-cn.md).
+cilium:
+  enabled: false
+  # How long the daemon waits for the cilium agent socket before giving up and
+  # restarting. Empty keeps the built-in default (5m). Go duration syntax.
+  waitTimeout: ""
+
+# NetworkPolicy enforcement.
+#
+# This chart installs no policy engine of its own. With this off, NetworkPolicy
+# objects in the cluster are simply not enforced -- nothing rejects them, so the
+# only symptom is traffic that should have been blocked getting through.
+#
+# Turning it on does not by itself provide an engine: it declares that one is
+# required. With provider "cilium" that means cilium.enabled must also be true,
+# and the chart refuses to render otherwise rather than installing a conflist
+# that silently enforces nothing.
+networkPolicy:
+  enabled: false
+  # Engine expected to enforce policy. "cilium" is the only accepted value.
+  provider: "cilium"
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  # limits are accepted too and render straight onto the container. They are not
+  # set by default: the daemon is on the path of every pod's CNI ADD, so a cpu
+  # limit throttles pod startup across the node, and a memory limit turns a
+  # transient spike into an OOMKill that takes IPAM down with it.
+  # limits:
+  #   cpu: 1
+  #   memory: 512Mi

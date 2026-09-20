@@ -1,0 +1,20 @@
+apiVersion: v2
+name: zenlayer-vpc-cni
+description: "The Kubernetes CNI plugin released by Zenlayer"
+type: application
+version: 1.0.0
+appVersion: "v1.0.0"
+keywords:
+  - zenlayer
+  - zec
+  - cni
+  - networking
+  - eni
+kubeVersion: ">=1.28.2"
+home: https://github.com/zenlayer/zenlayer-vpc-cni-k8s
+sources:
+  - https://github.com/zenlayer/zenlayer-vpc-cni-k8s
+maintainers:
+  - name: Zenlayer
+    email: security@zenlayer.com
+    url: https://github.com/zenlayer

@@ -1,0 +1,210 @@
+{{- /*
+Per-field validation lives in values.schema.json, which helm enforces before any
+template runs -- see the enums for dataPath / ipStack / networkMode and the
+minLength / minItems on the required identifiers.
+
+Rules spanning two fields cannot go there in a form that produces a usable
+error, so they live here. This one matters: asking for policy enforcement while
+the engine that would do the enforcing is switched off has to be an error, not a
+default. Rendering anyway would install a conflist that enforces nothing while
+the values file says policy is on, and the only symptom would be traffic that
+should have been blocked getting through.
+*/ -}}
+{{- if and .Values.networkPolicy.enabled (eq .Values.networkPolicy.provider "cilium") (not .Values.cilium.enabled) }}
+  {{- fail "networkPolicy.enabled=true with provider \"cilium\" requires cilium.enabled=true. Without it the conflist does not chain cilium-cni, so NetworkPolicy objects would be accepted and never enforced. Set cilium.enabled=true (and deploy Cilium itself -- see docs/deploy-cilium-chained.md), or set networkPolicy.enabled=false." }}
+{{- end }}
+{{- /*
+cni.mode picks who owns the pod device. "delegated" hands that to Cilium and
+leaves this plugin doing IPAM and host routing only, so it is meaningless
+without Cilium: rendering it anyway produces a conflist naming a plugin that is
+not installed, and every pod on the node fails ADD with a missing-binary error.
+*/ -}}
+{{- if and (eq .Values.cni.mode "delegated") (not .Values.cilium.enabled) }}
+  {{- fail "cni.mode=\"delegated\" requires cilium.enabled=true: in that mode Cilium is the plugin that creates the pod device, and this plugin only supplies addresses. Set cilium.enabled=true (and deploy Cilium itself -- see docs/deploy-cilium-netkit.md), or set cni.mode=\"chained\"." }}
+{{- end }}
+{{- /*
+Same shape, for the public IPv6 billing settings. The platform refuses to enable
+IPv6 on an interface without them when the subnet's ipv6Type is Public, which
+every dual-stack subnet seen so far is -- and the refusal lands inside pool
+warm-up, so the operator sees nodes that cannot create interfaces rather than a
+bad setting. The daemon validates this too; catching it here is what turns a
+cluster-wide CrashLoopBackOff into an install-time error.
+*/ -}}
+{{- if eq .Values.zec.ipStack "dual" }}
+  {{- if and (eq .Values.zec.ipv6InternetChargeType "ByTrafficPackage") (not (gt (float64 .Values.zec.ipv6PackageSize) 0.0)) }}
+    {{- fail "zec.ipStack=dual with zec.ipv6InternetChargeType=\"ByTrafficPackage\" requires zec.ipv6PackageSize (TB, a positive multiple of 0.1). A traffic commitment has no safe default, so set one -- note --set keeps fractions as strings, so use --set-json or a values file. If this account is on an hourly billing period the platform refuses committed package sizes outright; use zec.ipv6InternetChargeType=\"ByBandwidth\" there instead." }}
+  {{- end }}
+  {{- if and (eq .Values.zec.ipv6InternetChargeType "BandwidthCluster") (not .Values.zec.ipv6ClusterId) }}
+    {{- fail "zec.ipStack=dual with zec.ipv6InternetChargeType=\"BandwidthCluster\" requires zec.ipv6ClusterId, the shared bandwidth package the interface joins." }}
+  {{- end }}
+{{- end }}
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: zenlayer-cni-config
+  namespace: kube-system
+data:
+  # eni_conf is the daemon (zec-ipam) configuration, read via the k8s API.
+  # See pkg/daemon/config/config.go for the full schema.
+  # The OpenAPI credentials deliberately live in a Secret, not here -- the
+  # daemon reads them from /etc/zec_secret/ (see .Values.zec.secretName).
+  eni_conf: |
+    {
+      "networkMode": {{ .Values.zec.networkMode | quote }},
+      {{- /*
+        Deliberately absent from values.yaml: overriding the OpenAPI host is
+        only meaningful for Zenlayer-internal environments, and a customer who
+        sets it wrongly gets AUTHFAILURE_SIGNATURE_FAILURE rather than anything
+        that points at the cause. It is declared in values.schema.json all the
+        same -- zec rejects unknown keys now, so leaving it out of the schema
+        would turn the escape hatch itself into a validation error. Unset
+        renders nothing, so the default output is identical to not having this
+        at all. Non-production use: --set zec.openAPIDomain=<host>
+      */}}
+      {{- with .Values.zec.openAPIDomain }}
+      "openAPIDomain": {{ . | quote }},
+      {{- end }}
+      "vpcID": {{ .Values.zec.vpcID | quote }},
+      "subnets": [
+        {{- $last := sub (len .Values.zec.subnetIDs) 1 }}
+        {{- range $idx, $item := .Values.zec.subnetIDs }}
+        {{ quote $item }}{{ if ne $idx $last }},{{ end }}
+        {{- end }}
+      ],
+      "securityGroup": {{ .Values.zec.securityGroupID | quote }},
+      "ipStack": {{ .Values.zec.ipStack | quote }},
+      "ipv6InternetChargeType": {{ .Values.zec.ipv6InternetChargeType | quote }},
+      "ipv6Bandwidth": {{ .Values.zec.ipv6Bandwidth | toJson }},
+      "ipv6PackageSize": {{ .Values.zec.ipv6PackageSize | toJson }},
+      "ipv6ClusterId": {{ .Values.zec.ipv6ClusterId | quote }},
+      "serviceCidr": {{ .Values.zec.serviceCidr | quote }},
+      "poolTarget": {{ .Values.zec.poolTarget | int | toJson }},
+      "poolTargetMin": {{ .Values.zec.poolTargetMin | int | toJson }},
+      "poolTargetMax": {{ .Values.zec.poolTargetMax | int | toJson }},
+      "poolTargetCapProbe": {{ .Values.zec.poolTargetCapProbe | toJson }},
+      {{- /* Rendered explicitly rather than via `default`, which treats false
+             as empty and would turn an operator's explicit false back into
+             true. kindIs "invalid" is the only test that distinguishes unset
+             from false. Emitting the effective value rather than null keeps the
+             ConfigMap readable after a `helm upgrade --reuse-values`, which
+             carries the previous release's values forward and so does not pick
+             up a key added to values.yaml since. */}}
+      "manageUntaggedENI": {{ if kindIs "invalid" .Values.zec.manageUntaggedENI }}true{{ else }}{{ .Values.zec.manageUntaggedENI | toJson }}{{ end }},
+      "reconcileIntervalSec": {{ .Values.zec.reconcileIntervalSec | int | toJson }},
+      "poolMonitorIntervalSec": {{ .Values.zec.poolMonitorIntervalSec | int | toJson }},
+      "healthAndDebugPort": {{ .Values.zec.healthAndDebugPort | int | toJson }}
+    }
+  # CNI conflist installed to /etc/cni/net.d on each node.
+  10-zenlayer-cni.conflist: |
+{{- if eq .Values.cni.mode "delegated" }}
+    {{- /*
+    Delegated mode. Cilium is the plugin kubelet executes, and it calls zec-cni
+    through its ipam block: this plugin supplies the address and places the
+    per-ENI host routing, and creates no device at all.
+
+    The keys the chained conflist carries for zec-cni are absent on purpose, not
+    by oversight. eniip_virtual_type describes a device this plugin does not
+    build here, so rendering it would document a datapath that does not exist.
+    (veth_prefix is absent from both conflists: the chained one leaves it to the
+    plugin default as well.)
+
+    install_host_routes stays on. Without those ip rules a pod whose address
+    sits on a secondary interface leaves through the instance's own one, with a
+    source address belonging to a different port's MAC -- which the fabric
+    drops. The key is rendered explicitly rather than left to the plugin default
+    so that the conflist on disk states what the node is actually doing.
+
+    portmap is not chained here: this mode requires kubeProxyReplacement, and
+    cilium then serves hostPort from its own BPF load balancer, reading the Pod
+    spec rather than the CNI result.
+    */}}
+    {
+      "cniVersion": "0.4.0",
+      "name": "zenlayer-cni",
+      "plugins": [
+        {
+          "type": "cilium-cni",
+          "ipam": {
+            "type": "zec-cni",
+            "zec_mode": "ipam-only",
+            "install_host_routes": true
+          },
+          {{- /* Same reasoning as the chained conflist: exec'd by kubelet, so
+                 it cannot read any pod env. */}}
+          "enable-debug": {{ or (eq .Values.zec.logLevel "debug") (eq .Values.zec.logLevel "trace") }},
+          "log-file": "/var/run/cilium/cilium-cni.log"
+        }
+      ]
+    }
+{{- else }}
+    {
+      "cniVersion": "0.4.0",
+      "name": "zenlayer-cni",
+      "plugins": [
+        {
+          "type": "zec-cni",
+          "eniip_virtual_type": {{ .Values.zec.dataPath | quote }},
+          {{- /* zec-cni is exec'd by kubelet and cannot see the DaemonSet env. */}}
+          {{- /* trace is more verbose than debug, so it must not turn the
+                 plugin's debug logging back off. */}}
+          {{- /*
+          debug is last, so no trailing comma.
+
+          capabilities.bandwidth is deliberately not declared: this plugin does
+          not consume runtimeConfig.bandwidth, and declaring the capability
+          would make kubelet pass bandwidth annotations to a plugin that
+          silently ignores them.
+          */}}
+          "debug": {{ or (eq .Values.zec.logLevel "debug") (eq .Values.zec.logLevel "trace") }}
+        },
+{{- if .Values.cilium.enabled }}
+        {{- /*
+        Second plugin, only when cilium.enabled is set. That is not the same as
+        network policy being on: cilium.enabled alone chains cilium for
+        observability, and networkPolicy.enabled additionally requires it.
+
+        Order matters and this one has to be last: CNI runs ADD in list order
+        and DEL in reverse, so cilium sees a pod that is already wired on the
+        way in, and releases its endpoint before the device is torn down on the
+        way out.
+
+        chaining-mode is set explicitly rather than relying on the network name.
+        cilium-cni also falls back to looking up a chainer registered under the
+        conflist's "name", which would tie our network name to a cilium
+        registry entry -- a rename here would then silently stop chaining.
+
+        The pod device is a veth pair, which is what generic-veth requires: it
+        picks the first link of type veth in the netns and refuses anything
+        else. Nothing in this conflist needs to describe the ENI or the policy
+        routing -- the chainer reads neither.
+        */}}
+        {
+          "type": "cilium-cni",
+          "chaining-mode": "generic-veth",
+          {{- /* Same reasoning as zec-cni's "debug" above: this plugin is
+                 exec'd by kubelet and cannot see any pod env. */}}
+          "enable-debug": {{ or (eq .Values.zec.logLevel "debug") (eq .Values.zec.logLevel "trace") }},
+          "log-file": "/var/run/cilium/cilium-cni.log"
+        }
+{{- else }}
+        {{- /*
+        portmap is rendered only without cilium, where it is the only thing that
+        implements hostPort: leave it out and kubelet never passes the port
+        mappings down while the API server still accepts the field -- no error,
+        no event. With cilium enabled its BPF load balancer serves hostPort
+        instead, and portmap was measured handling zero packets.
+
+        snat is upstream's own default, pinned here so an upstream change cannot
+        alter it silently: it masquerades traffic reaching the hostPort from the
+        pod network, and is scoped to those connections alone -- nothing to do
+        with pod egress, which this plugin still never SNATs.
+        */}}
+        {
+          "type": "portmap",
+          "capabilities": {"portMappings": true},
+          "snat": true
+        }
+{{- end }}
+      ]
+    }
+{{- end }}
