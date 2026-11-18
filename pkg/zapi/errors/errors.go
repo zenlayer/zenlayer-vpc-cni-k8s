@@ -39,7 +39,7 @@ const (
 	AuthInvalidAuthorization  = "AUTHFAILURE_INVALID_AUTHORIZATION"  // Invalid Authorization header format
 	AuthSignatureFailure      = "AUTHFAILURE_SIGNATURE_FAILURE"      // Signature calculation failed
 	AuthUnauthorizedOperation = "AUTHFAILURE_UNAUTHORIZED_OPERATION" // Unauthorized operation
-	AuthSignatureExpired      = "AUTHFAILURE_SIGNATURE_EXPIRED"      // Signature expired (timestamp must be within 5 minutes of server time)
+	AuthSignatureExpired      = "AUTHFAILURE_SIGNATURE_EXPIRED"      // Signature expired: the request timestamp is too far behind the server's (measured: a clock 20 min behind is refused, one 2 h ahead is accepted)
 	// 400 Series - Parameter Errors
 	MissingParameter                = "MISSING_PARAMETER"                   // Required parameter is missing
 	InvalidParameterType            = "INVALID_PARAMETER_TYPE"              // Invalid parameter type
@@ -132,6 +132,11 @@ const (
 	// non-retryable set, and GetResourceLimit never subtracted the unusable
 	// capacity, so the scheduler kept placing pods that could not start.
 	OPERATION_DENIED_SUBNET_IP_INSUFFICIENT = "OPERATION_DENIED_SUBNET_IP_INSUFFICIENT"
+	// INVALID_SUBNET_IPV4_INSUFFICIENT is what CreateNetworkInterface returns
+	// once the subnet has no address left for the interface's own primary
+	// ("… insufficient available IPv4 addresses, `0` remaining"). It is the
+	// same exhaustion as above and must be matched wherever that one is.
+	INVALID_SUBNET_IPV4_INSUFFICIENT = "INVALID_SUBNET_IPV4_INSUFFICIENT"
 	// OPERATION_DENIED_INSTANCE_ATTACH_NIC_EXCEED_LIMIT is what an attach call
 	// returns once the instance already carries as many interfaces as it may.
 	// It is distinct from LimitExceededEnisPerInstance, which the create call
@@ -263,6 +268,9 @@ func (f *EventInfoField) String() string {
 var (
 	cantRetryErrEventLimiter *rate.Limiter
 	flowLimitEventLimiter    *rate.Limiter
+	// Separate because a rejected credential or an unreachable endpoint fails
+	// every call; sharing a budget would starve the quota and subnet events.
+	connectivityEventLimiter *rate.Limiter
 )
 
 func AllowRecordErrEvent() bool {
@@ -270,6 +278,13 @@ func AllowRecordErrEvent() bool {
 		return true
 	}
 	return cantRetryErrEventLimiter.Allow()
+}
+
+func allowRecordConnectivityEvent() bool {
+	if connectivityEventLimiter == nil {
+		return true
+	}
+	return connectivityEventLimiter.Allow()
 }
 
 func AllowRecordFlowLimitEvent() bool {
@@ -313,16 +328,61 @@ func RecordOpenAPIErrEvent(err error, fields ...EventInfoField) {
 		}
 	}
 
-	switch errCode {
-	case InsufficientIpInSubnet, OPERATION_DENIED_SUBNET_IP_INSUFFICIENT:
-		if AllowRecordErrEvent() {
-			_ = tracing.RecordNodeEvent(v1.EventTypeWarning, tracing.EventInsufficientIpInSubnet, fmtInfo)
-		}
-	case FlowLimitExceeded, AccountFlowLimitExceeded:
+	switch reason := OpenAPIErrEventReason(err); reason {
+	case "":
+	case tracing.EventOpenApiFlowLimit:
 		if AllowRecordFlowLimitEvent() {
-			_ = tracing.RecordNodeEvent(v1.EventTypeWarning, tracing.EventOpenApiFlowLimit, fmtInfo)
+			_ = tracing.RecordNodeEvent(v1.EventTypeWarning, reason, fmtInfo)
+		}
+	case tracing.EventCredentialServiceAbnormal, tracing.EventOpenApiPermissionDenied,
+		tracing.EventOpenApiUnreachable, tracing.EventNodeClockSkew:
+		if allowRecordConnectivityEvent() {
+			_ = tracing.RecordNodeEvent(v1.EventTypeWarning, reason, fmtInfo)
+		}
+	default:
+		if AllowRecordErrEvent() {
+			_ = tracing.RecordNodeEvent(v1.EventTypeWarning, reason, fmtInfo)
 		}
 	}
+}
+
+// OpenAPIErrEventReason maps an OpenAPI error to the node event reason it is
+// reported under, or "" for errors that raise no event of their own. Quota
+// codes are matched by prefix in RecordOpenAPIErrEvent and are not covered.
+//
+// Credential and connectivity failures stop every allocation on the node, and
+// the SDK reports both as its own error type -- a transport failure comes back
+// as NETWORK_ERROR, not as the underlying net error.
+func OpenAPIErrEventReason(err error) string {
+	var respErr *zecCom.ZenlayerCloudSdkError
+	if !errors.As(err, &respErr) {
+		return ""
+	}
+	errCode := respErr.GetCode()
+	switch {
+	case errCode == InsufficientIpInSubnet, errCode == OPERATION_DENIED_SUBNET_IP_INSUFFICIENT,
+		errCode == INVALID_SUBNET_IPV4_INSUFFICIENT:
+		return tracing.EventInsufficientIpInSubnet
+	case errCode == FlowLimitExceeded, errCode == AccountFlowLimitExceeded:
+		return tracing.EventOpenApiFlowLimit
+	case errCode == AuthSignatureExpired:
+		// Rejected for the request timestamp, not the key: the node clock is
+		// off, and replacing the credential would not help.
+		return tracing.EventNodeClockSkew
+	case errCode == AuthUnauthorizedOperation:
+		// The key is valid but lacks a permission: the fix is a policy grant,
+		// not a new credential.
+		return tracing.EventOpenApiPermissionDenied
+	case strings.HasPrefix(errCode, "AUTHFAILURE"), errCode == zecCom.CredentialMissingError:
+		return tracing.EventCredentialServiceAbnormal
+	case errCode == zecCom.NetworkError, errCode == zecCom.IoError,
+		errCode == zecCom.SecurityChallengeError, errCode == zecCom.RequestBlockedError,
+		errCode == zecCom.JsonParseError:
+		// The last three are something in front of the endpoint answering
+		// instead of it: a challenge, a block, or a gateway's HTML error page.
+		return tracing.EventOpenApiUnreachable
+	}
+	return ""
 }
 
 func init() {
@@ -331,6 +391,9 @@ func init() {
 	}
 	if cantRetryErrEventLimiter == nil {
 		cantRetryErrEventLimiter = rate.NewLimiter(5, 5)
+	}
+	if connectivityEventLimiter == nil {
+		connectivityEventLimiter = rate.NewLimiter(1, 5)
 	}
 }
 

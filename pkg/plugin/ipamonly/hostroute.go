@@ -62,7 +62,7 @@ type hostRouting struct {
 //   - `to <podIP> lookup main` at prio 512, so traffic aimed at a local pod
 //     reaches main before the rule above can divert it. Same-node pod to pod is
 //     the case that needs it: the source is the client pod, so prio 2048 would
-//     otherwise send a packet destined for a neighbour out of the ENI's default
+//     otherwise send a packet destined for a neighbor out of the ENI's default
 //     route.
 //   - a default route in the ENI's own table, which is what prio 2048 selects.
 //
@@ -310,6 +310,9 @@ func ensureENIAddrs(logger zlog.Logger, hr *hostRouting, link netlink.Link, tabl
 	if v6 != nil {
 		if err := linuxUtils.EnsureLinkNetConf(name); err != nil {
 			return fmt.Errorf("apply net config to eni %s: %w", name, err)
+		}
+		if err := linuxUtils.EnsureAcceptRAOff(name); err != nil {
+			return fmt.Errorf("refuse router advertisements on eni %s: %w", name, err)
 		}
 	}
 	return nil

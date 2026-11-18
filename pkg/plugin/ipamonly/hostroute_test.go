@@ -32,7 +32,7 @@ func hostIP(t *testing.T, s string) *net.IPNet {
 //
 // Getting the pair backwards is silent: the pod still reaches off-node
 // destinations, and only same-node pod-to-pod breaks, because a packet aimed at
-// a neighbour would be matched by the source rule and sent out of the ENI's
+// a neighbor would be matched by the source rule and sent out of the ENI's
 // default route instead of staying on the node.
 func TestPodRulesDirectionAndPriority(t *testing.T) {
 	const table = 1196

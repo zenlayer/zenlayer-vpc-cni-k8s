@@ -112,11 +112,37 @@ jobs:
           helm lint chart \
             --set zec.vpcID=vpc-test \
             --set zec.subnetIDs={subnet-test} \
-            --set zec.securityGroupID=sg-test
+            --set zec.securityGroupID=sg-test \
+            --set zec.ipamType=direct \
+            --set zec.ipStack=ipv4 \
+            --set zec.manageUntaggedENI=false \
+            --set cni.mode=chained \
+            --set cilium.enabled=false \
+            --set networkPolicy.enabled=false
 
       - name: helm template
         run: |
           helm template zenlayer-vpc-cni chart \
             --set zec.vpcID=vpc-test \
             --set zec.subnetIDs={subnet-test} \
-            --set zec.securityGroupID=sg-test
+            --set zec.securityGroupID=sg-test \
+            --set zec.ipamType=direct \
+            --set zec.ipStack=ipv4 \
+            --set zec.manageUntaggedENI=false \
+            --set cni.mode=chained \
+            --set cilium.enabled=false \
+            --set networkPolicy.enabled=false
+
+      - name: helm template (ipamType crd)
+        run: |
+          helm template zenlayer-vpc-cni chart \
+            --set zec.ipamType=crd \
+            --set zec.ipStack=ipv4 \
+            --set controlplane.deployment.enabled=true \
+            --set controlplane.regionID=region-test \
+            --set zec.vpcID=vpc-test \
+            --set zec.subnetIDs={subnet-test} \
+            --set zec.securityGroupID=sg-test \
+            --set zec.manageUntaggedENI=false \
+            --set cni.mode=chained --set cilium.enabled=false --set networkPolicy.enabled=false \
+            --api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy > /dev/null

@@ -4,6 +4,7 @@
 package pool
 
 import (
+	"net"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 // still has, which is what GC rebuilds the available queue from.
 type listFactory struct {
 	normal   map[string]types.NetResource
+	legacy   map[string]types.NetResource
 	released []string
 }
 
@@ -32,7 +34,7 @@ func (f *listFactory) ReleaseInValid(r types.NetResource) (types.NetResource, er
 	return r, nil
 }
 func (f *listFactory) List() (map[types.ResStatus]map[string]types.NetResource, error) {
-	return map[types.ResStatus]map[string]types.NetResource{types.ResStatusNormal: f.normal}, nil
+	return map[types.ResStatus]map[string]types.NetResource{types.ResStatusNormal: f.normal, types.ResStatusLegacy: f.legacy}, nil
 }
 
 // gcPool builds a pool holding one in-use resource whose owner is podKey, old
@@ -132,5 +134,84 @@ func TestGCProtectPeriodStillApplies(t *testing.T) {
 
 	if _, held := p.inUse[id]; !held {
 		t.Fatal("a resource handed out seconds ago was reclaimed inside the protect period")
+	}
+}
+
+// GC that leaves something in invalid asks the worker to release it now,
+// instead of at the next monitor cycle.
+func TestGCWithInvalidAsksForRecheck(t *testing.T) {
+	p, f := gcPool(t, "a", "ns/pod", nil)
+	p.recheck = make(chan struct{}, 1)
+	if err := p.GC(noRecords); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-p.recheck:
+		t.Fatal("recheck asked for with nothing invalid")
+	default:
+	}
+	f.legacy = map[string]types.NetResource{"b": &fakeRes{id: "b"}}
+	if err := p.GC(noRecords); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-p.recheck:
+	default:
+		t.Fatal("GC left b in invalid without asking the worker to release it")
+	}
+}
+
+// An address a pod holds is not given back even when the factory lists it
+// under another ID than the pod's record: a dual-stack record is eni/<v4>-<v6>,
+// while an interface rebuilt after dropping out of a describe re-adopts the
+// pod's IPv4 alone as eni/<v4> and lists it Legacy.
+func TestGCKeepsLegacyEntryWhoseAddressIsHeld(t *testing.T) {
+	rec := eniIP("eni-x", false, "10.0.0.10")
+	rec.IPSet.IPv6 = net.ParseIP("2001:db8::a")
+	p := newTestPool()
+	p.maxCap, p.ticket = 10, make(chan struct{}, 10)
+	p.metricsMaxCap = prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_max_cap_held"})
+	p.gcProtectPeriod = time.Minute
+	p.inUse[rec.GetID()] = poolItem{owner: "ns/pod", res: rec, lastUse: time.Now()}
+	bare := eniIP("eni-x", false, "10.0.0.10")
+	other := eniIP("eni-x", false, "10.0.0.11")
+	p.factory = &listFactory{legacy: map[string]types.NetResource{bare.GetID(): bare, other.GetID(): other}}
+	records := func() (map[string]types.NetResourceAllocated, error) {
+		return map[string]types.NetResourceAllocated{rec.GetID(): {Owner: "ns/pod", Resource: rec}}, nil
+	}
+	if err := p.GC(records); err != nil {
+		t.Fatal(err)
+	}
+	if _, queued := p.invalid[bare.GetID()]; queued {
+		t.Fatal("the pod's address was queued to be given back under its bare-IPv4 ID")
+	}
+	if _, queued := p.invalid[other.GetID()]; !queued {
+		t.Fatal("an idle legacy address was not queued")
+	}
+}
+
+// Nor is such an address queued as available: an interface rebuilt in a pod
+// subnet re-adopts its pods' addresses as Normal entries under fresh IDs, and
+// queuing one would hand a pod's address to a second pod.
+func TestGCDoesNotQueueNormalEntryWhoseAddressIsHeld(t *testing.T) {
+	rec := eniIP("eni-x", false, "10.0.0.10")
+	rec.IPSet.IPv6 = net.ParseIP("2001:db8::a")
+	p := newTestPool()
+	p.maxCap, p.ticket = 10, make(chan struct{}, 10)
+	p.metricsMaxCap = prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_max_cap_normal"})
+	p.gcProtectPeriod = time.Minute
+	p.inUse[rec.GetID()] = poolItem{owner: "ns/pod", res: rec, lastUse: time.Now()}
+	fresh := eniIP("eni-x", false, "10.0.0.10")
+	fresh.IPSet.IPv6 = net.ParseIP("2001:db8::b") // a new pairing of the same IPv4
+	idle := eniIP("eni-x", false, "10.0.0.11")
+	p.factory = &listFactory{normal: map[string]types.NetResource{fresh.GetID(): fresh, idle.GetID(): idle}}
+	records := func() (map[string]types.NetResourceAllocated, error) {
+		return map[string]types.NetResourceAllocated{rec.GetID(): {Owner: "ns/pod", Resource: rec}}, nil
+	}
+	if err := p.GC(records); err != nil {
+		t.Fatal(err)
+	}
+	if p.available.Size() != 1 {
+		t.Fatalf("%d available; want only the idle address", p.available.Size())
 	}
 }

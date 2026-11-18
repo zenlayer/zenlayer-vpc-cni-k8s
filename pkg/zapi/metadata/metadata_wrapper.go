@@ -57,7 +57,8 @@ func getArray(jsonStr string) ([]string, error) {
 }
 
 // GetENIsMACs lists the MAC addresses of every interface attached to this
-// instance. Every other call in this file is keyed on one of them.
+// instance. Every other call in this file is keyed on one of them. The
+// service answers a directory listing, one "mac/" per line, not JSON.
 func (meta EC2MetadataWrapper) GetENIsMACs(ctx context.Context) ([]string, error) {
 	start := time.Now()
 	macsStr, err := meta.GetMetadata(ctx, enisPath)
@@ -67,7 +68,18 @@ func (meta EC2MetadataWrapper) GetENIsMACs(ctx context.Context) ([]string, error
 		metrics.MetadataErrInc("GetENIsMACs", err)
 		return []string{}, err
 	}
-	return getArray(macsStr)
+	return parseMACListing(macsStr), nil
+}
+
+// parseMACListing reads a directory listing of interface MACs.
+func parseMACListing(listing string) []string {
+	var macs []string
+	for _, f := range strings.Fields(listing) {
+		if mac := strings.TrimSuffix(f, "/"); mac != "" {
+			macs = append(macs, mac)
+		}
+	}
+	return macs
 }
 
 func (meta EC2MetadataWrapper) GetENIID(ctx context.Context, mac string) (string, error) {
@@ -158,8 +170,8 @@ func (meta EC2MetadataWrapper) GetENIPrivateIPv4s(ctx context.Context, mac strin
 	if len(ipsStr) == 0 {
 		return nil, nil
 	}
-	// The metadata service returns this as a JSON array (["10.0.0.16"]), the
-	// same shape getArray already handles for the MAC listing. Splitting on
+	// The metadata service returns this as a JSON array (["10.0.0.16"]),
+	// unlike the MAC listing, which is one entry per line. Splitting on
 	// newlines instead yields the whole literal as one element that fails to
 	// parse as an address. That failure only shows up once an interface has a
 	// secondary IP: an empty "[]" splits into something harmless.

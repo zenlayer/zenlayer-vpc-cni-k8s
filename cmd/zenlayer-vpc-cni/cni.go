@@ -54,7 +54,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 		"podNamespace": string(k8sConfig.K8S_POD_NAMESPACE),
 		"containerID":  string(k8sConfig.K8S_POD_INFRA_CONTAINER_ID),
 	})
-	if conf.Debug {
+	if conf.DebugEnabled() {
 		// The level is a literal this package's own levelMap contains, so the
 		// only error SetLogLevel can return is unreachable here.
 		_ = logger.SetLogLevel("debug")
@@ -145,7 +145,7 @@ func cmdDel(args *skel.CmdArgs) error {
 		"podNamespace": string(k8sConfig.K8S_POD_NAMESPACE),
 		"containerID":  string(k8sConfig.K8S_POD_INFRA_CONTAINER_ID),
 	})
-	if conf.Debug {
+	if conf.DebugEnabled() {
 		// The level is a literal this package's own levelMap contains, so the
 		// only error SetLogLevel can return is unreachable here.
 		_ = logger.SetLogLevel("debug")

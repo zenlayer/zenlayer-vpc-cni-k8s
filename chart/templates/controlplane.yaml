@@ -1,0 +1,422 @@
+{{- if eq .Values.zec.ipamType "crd" }}
+{{- $cp := .Values.controlplane }}
+{{- /*
+Namespaces are kube-system throughout, matching the daemon's ServiceAccount
+and DaemonSet. Every daemon shares one ServiceAccount, so RBAC cannot keep a node to its own
+ZecNode. The API server puts the node a pod runs on into its service account
+token (authentication.kubernetes.io/node-name), and the policy below keys on
+that. Without the admission API the chart refuses to render rather than
+install a crd mode whose node isolation silently is not there; an offline
+render needs --api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy.
+*/}}
+{{- if not (or $cp.platformUser $cp.deployment.enabled) }}
+{{- fail "zec.ipamType=crd needs a controlplane: set controlplane.platformUser to the user a platform-run controlplane authenticates as, or controlplane.deployment.enabled=true to run one in this cluster. Without either, nodes wait forever for addresses." }}
+{{- end }}
+{{- /* The controlplane refuses these at startup; refuse them here instead,
+where the install fails rather than the controlplane crash-looping. */}}
+{{- $scalers := list $cp.scaler }}
+{{- range $cp.nodeGroups }}{{- $scalers = append $scalers .scaler }}{{- end }}
+{{- range $scalers }}
+{{- $s := . }}
+{{- if or (lt (int $s.targetMin) 0) (le (int $s.target) 0) (gt (int $s.targetMin) (int $s.target)) }}
+{{- fail (printf "controlplane scaler needs 0 <= targetMin <= target and target > 0, got targetMin=%v target=%v" $s.targetMin $s.target) }}
+{{- end }}
+{{- end }}
+{{- if and $cp.platformUser $cp.deployment.enabled }}
+{{- fail "set only one of controlplane.platformUser and controlplane.deployment.enabled: two controlplanes would share one leader lease while holding different configurations." }}
+{{- end }}
+{{- if not (.Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy") }}
+{{- fail "zec.ipamType=crd needs admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy (Kubernetes 1.30 or later): it is what keeps each node to its own ZecNode. For an offline render pass --api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy." }}
+{{- end }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: zenlayer-vpc-cni-zecnode-owner
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [ "network.zenlayer.com" ]
+        apiVersions: [ "*" ]
+        # A patch is admitted as an UPDATE. The daemon has no create or delete.
+        operations: [ "UPDATE" ]
+        resources: [ "zecnodes" ]
+  matchConditions:
+    - name: daemon
+      expression: request.userInfo.username == "system:serviceaccount:kube-system:zenlayer-vpc-cni-plugin"
+  variables:
+    - name: node
+      expression: >-
+        has(request.userInfo.extra) && 'authentication.kubernetes.io/node-name' in request.userInfo.extra
+        ? request.userInfo.extra['authentication.kubernetes.io/node-name'][0] : ''
+  validations:
+    - expression: variables.node != '' && object.metadata.name == variables.node
+      messageExpression: "'a node may only change its own ZecNode, not ' + object.metadata.name"
+    - expression: >-
+        (has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}) &&
+        (has(object.metadata.annotations) ? object.metadata.annotations : {}) == (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}) &&
+        (has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []) == (has(oldObject.metadata.ownerReferences) ? oldObject.metadata.ownerReferences : []) &&
+        (has(object.metadata.finalizers) ? object.metadata.finalizers : []) == (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : [])
+      message: "a node may only change the spec of its ZecNode"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: zenlayer-vpc-cni-zecnode-owner
+spec:
+  policyName: zenlayer-vpc-cni-zecnode-owner
+  validationActions: [ "Deny" ]
+---
+# The daemon's ClusterRole lets it patch pods (it annotates the pods it serves).
+# Unbounded, a node taken over could rewrite any pod -- the controlplane's own
+# included, whose image change would hand over the credentials it mounts. So a
+# daemon may change only the annotations of pods on its own node.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: zenlayer-vpc-cni-pod-patch
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [ "" ]
+        apiVersions: [ "v1" ]
+        operations: [ "UPDATE" ]
+        resources: [ "pods" ]
+  matchConditions:
+    - name: daemon
+      expression: request.userInfo.username == "system:serviceaccount:kube-system:zenlayer-vpc-cni-plugin"
+  variables:
+    - name: node
+      expression: >-
+        has(request.userInfo.extra) && 'authentication.kubernetes.io/node-name' in request.userInfo.extra
+        ? request.userInfo.extra['authentication.kubernetes.io/node-name'][0] : ''
+  validations:
+    - expression: variables.node != '' && has(oldObject.spec.nodeName) && oldObject.spec.nodeName == variables.node
+      message: "a node may only change pods scheduled on it"
+    - expression: >-
+        object.spec == oldObject.spec &&
+        (has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}) &&
+        (has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []) == (has(oldObject.metadata.ownerReferences) ? oldObject.metadata.ownerReferences : []) &&
+        (has(object.metadata.finalizers) ? object.metadata.finalizers : []) == (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : [])
+      message: "a node may only change pod annotations"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: zenlayer-vpc-cni-pod-patch
+spec:
+  policyName: zenlayer-vpc-cni-pod-patch
+  validationActions: [ "Deny" ]
+---
+# The daemon may evict pods (when a node runs out of addresses), but never the
+# controlplane's: evicting it again and again would stall every node, and
+# could push it onto the evicting node, where its credentials are mounted. An
+# eviction names only the pod, not its node, so the controlplane is matched by
+# name.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: zenlayer-vpc-cni-eviction
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [ "" ]
+        apiVersions: [ "v1" ]
+        operations: [ "CREATE" ]
+        resources: [ "pods/eviction" ]
+  matchConditions:
+    - name: daemon
+      expression: request.userInfo.username == "system:serviceaccount:kube-system:zenlayer-vpc-cni-plugin"
+  validations:
+    - expression: >-
+        !(request.namespace == 'kube-system' && request.name.startsWith('zenlayer-vpc-cni-controlplane-'))
+      message: "the node daemon may not evict the controlplane"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: zenlayer-vpc-cni-eviction
+spec:
+  policyName: zenlayer-vpc-cni-eviction
+  validationActions: [ "Deny" ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: zenlayer-vpc-cni-controlplane
+rules:
+  - apiGroups: [ "network.zenlayer.com" ]
+    # delete: a ZecNode outlives its Node to keep the name's instance binding,
+    # and is removed by the controlplane once that binding protects nothing.
+    resources: [ "zecnodes" ]
+    verbs: [ "get", "list", "watch", "create", "update", "patch", "delete" ]
+  - apiGroups: [ "network.zenlayer.com" ]
+    resources: [ "zecnodes/status" ]
+    verbs: [ "update", "patch" ]
+  # Nodes are served from their labels and addresses; an empty providerID is
+  # filled once the node's identity is verified (identity.providerID auto).
+  - apiGroups: [ "" ]
+    resources: [ "nodes" ]
+    verbs: [ "get", "list", "watch", "patch" ]
+  # The cluster id (the kube-system namespace's uid) tagged on every interface
+  # created, so a VPC shared by several clusters is swept per cluster.
+  - apiGroups: [ "" ]
+    resources: [ "namespaces" ]
+    resourceNames: [ "kube-system" ]
+    verbs: [ "get" ]
+  - apiGroups: [ "" ]
+    resources: [ "events" ]
+    verbs: [ "create", "patch", "update" ]
+  - apiGroups: [ "events.k8s.io" ]
+    resources: [ "events" ]
+    verbs: [ "create", "patch", "update" ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: zenlayer-vpc-cni-controlplane
+  namespace: kube-system
+rules:
+  - apiGroups: [ "coordination.k8s.io" ]
+    resources: [ "leases" ]
+    verbs: [ "get", "create", "update" ]
+{{- if or $cp.platformUser $cp.deployment.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: zenlayer-vpc-cni-controlplane
+subjects:
+  {{- with $cp.platformUser }}
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: {{ . | quote }}
+  {{- end }}
+  {{- if $cp.deployment.enabled }}
+  - kind: ServiceAccount
+    name: zenlayer-vpc-cni-controlplane
+    namespace: kube-system
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: zenlayer-vpc-cni-controlplane
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: zenlayer-vpc-cni-controlplane
+  namespace: kube-system
+subjects:
+  {{- with $cp.platformUser }}
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: {{ . | quote }}
+  {{- end }}
+  {{- if $cp.deployment.enabled }}
+  - kind: ServiceAccount
+    name: zenlayer-vpc-cni-controlplane
+    namespace: kube-system
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: zenlayer-vpc-cni-controlplane
+{{- end }}
+{{- if $cp.deployment.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: zenlayer-vpc-cni-controlplane
+  namespace: kube-system
+---
+# The controlplane's own configuration. Everything platform-facing lives here,
+# never in an object the nodes can write.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zenlayer-vpc-cni-controlplane
+  namespace: kube-system
+data:
+  config.json: |
+{{ include "zenlayer-vpc-cni.controlplaneConfig" . | indent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zenlayer-vpc-cni-controlplane
+  namespace: kube-system
+  labels:
+    app: zenlayer-vpc-cni-controlplane
+spec:
+  replicas: {{ $cp.deployment.replicas }}
+  # One at a time, old pod first: the health port is a host port, so a new
+  # pod cannot start beside an old one on the same node.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: zenlayer-vpc-cni-controlplane
+  template:
+    metadata:
+      labels:
+        app: zenlayer-vpc-cni-controlplane
+      annotations:
+        checksum/config: {{ include "zenlayer-vpc-cni.controlplaneConfig" . | sha256sum }}
+    spec:
+      serviceAccountName: zenlayer-vpc-cni-controlplane
+      # The pod network is what this provides: a pod IP would wait on itself.
+      hostNetwork: true
+      # The host's resolver, not cluster DNS: cluster DNS runs in pods, which
+      # need the addresses this provides.
+      dnsPolicy: Default
+      priorityClassName: "system-cluster-critical"
+      # The taints of a node still coming up (nothing else there could
+      # provide the pod network) and of control-plane nodes; not cordon, so a
+      # drain moves it, and not eviction from a node that stopped answering:
+      # the single default replica must move off both.
+      tolerations:
+        {{- range list "node-role.kubernetes.io/control-plane" "node-role.kubernetes.io/master" "node.kubernetes.io/not-ready" "node.kubernetes.io/network-unavailable" "node.cloudprovider.kubernetes.io/uninitialized" "node.cilium.io/agent-not-ready" }}
+        - key: {{ . | quote }}
+          operator: "Exists"
+          effect: "NoSchedule"
+        {{- end }}
+        - operator: "Exists"
+          effect: "PreferNoSchedule"
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoExecute"
+        - key: "node.kubernetes.io/unreachable"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 60
+      # Control-plane nodes preferred, deployment.nodeSelector required: the
+      # credentials are mounted wherever this runs, and a worker runs tenant
+      # workloads.
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/arch: amd64
+        {{- with $cp.deployment.nodeSelector }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      securityContext:
+        # The Secret is mounted 0440 to this group, so the unprivileged user
+        # below reads it and nothing else in the pod's user range does.
+        fsGroup: 65534
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: zenlayer-vpc-cni-controlplane
+      containers:
+        - name: zec-controlplane
+          image: {{ $cp.deployment.image | default (printf "%s-controlplane:%s" .Values.image.repository .Values.image.tag) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            runAsUser: 65534
+            runAsGroup: 65534
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ "ALL" ]
+          command:
+            - /bin/zec-controlplane
+            - --config=/etc/zec-controlplane/config.json
+            - --lease-namespace=kube-system
+            - --health-addr=:11416
+            {{- with .Values.zec.logLevel }}
+            - --log-level={{ . }}
+            {{- end }}
+          {{- $api := include "zenlayer-vpc-cni.apiserver" . | fromYaml }}
+          {{- if or $api.host $api.port }}
+          env:
+            {{- /* Same reason as the daemon's: without kube-proxy the
+                   ClusterIP may be served by nothing until the CNI is up. */}}
+            {{- with $api.host }}
+            - name: KUBERNETES_SERVICE_HOST
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $api.port }}
+            - name: KUBERNETES_SERVICE_PORT
+              value: {{ . | quote }}
+            {{- end }}
+          {{- end }}
+          ports:
+            # A host port with hostNetwork: two replicas are never placed on
+            # one node, where the second could not serve its health check.
+            - name: health
+              containerPort: 11416
+              protocol: TCP
+          readinessProbe:
+            # Not ready while it waits for credentials, subnets or the CRD:
+            # with 2 or more replicas, a rollout to a configuration that never
+            # finishes starting stops after the first. The single default
+            # replica is replaced first (maxSurge 0), so it gets no such stop.
+            httpGet:
+              path: /healthz
+              port: 11416
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml $cp.deployment.resources | nindent 12 }}
+          volumeMounts:
+            - mountPath: /etc/zec-controlplane
+              name: config
+              readOnly: true
+            - mountPath: /etc/zec_secret/
+              name: zec-secret
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: zenlayer-vpc-cni-controlplane
+        - name: zec-secret
+          secret:
+            secretName: {{ .Values.zec.secretName }}
+            defaultMode: 0440
+{{- end }}
+{{- end }}
+{{- /* The rendered config.json; the Deployment hashes this, so only a change
+     the controlplane actually reads rolls it. */ -}}
+{{- define "zenlayer-vpc-cni.controlplaneConfig" -}}
+{
+  {{- with .Values.zec.openAPIDomain }}
+  "openAPIDomain": {{ . | quote }},
+  {{- end }}
+  "regionID": {{ .Values.controlplane.regionID | quote }},
+  "vpcID": {{ .Values.zec.vpcID | quote }},
+  "subnets": {{ .Values.zec.subnetIDs | toJson }},
+  "securityGroup": {{ .Values.zec.securityGroupID | quote }},
+  "ipStack": {{ .Values.zec.ipStack | quote }},
+  {{- if eq .Values.zec.ipStack "dual" }}
+  "ipv6InternetChargeType": {{ .Values.zec.ipv6InternetChargeType | quote }},
+  "ipv6Bandwidth": {{ .Values.zec.ipv6Bandwidth | toJson }},
+  "ipv6PackageSize": {{ .Values.zec.ipv6PackageSize | toJson }},
+  "ipv6ClusterId": {{ .Values.zec.ipv6ClusterId | quote }},
+  {{- end }}
+  "manageUntaggedENI": {{ .Values.zec.manageUntaggedENI | toJson }},
+  "credentialDir": "/etc/zec_secret",
+  "identity": {"providerID": {{ .Values.controlplane.identity.providerID | quote }}},
+  "scaler": {{ .Values.controlplane.scaler | toJson }},
+  "nodeGroups": {{ .Values.controlplane.nodeGroups | toJson }},
+  "workers": {{ .Values.controlplane.deployment.workers | int | toJson }}
+}
+{{- end }}

@@ -161,7 +161,7 @@ func GetCmdArgs(args *skel.CmdArgs) (*cniCmdArgs, error) {
 			fmt.Sprintf("veth_prefix %q is longer than %d characters", conf.HostVethPrefix, maxVethPrefixLen))
 	}
 
-	// Refuse an unrecognised zec_mode here rather than at the dispatch, so both
+	// Refuse an unrecognized zec_mode here rather than at the dispatch, so both
 	// ADD and DEL reject it identically and neither can act on a config the
 	// other would have turned away.
 	if err = conf.ValidateIPAM(); err != nil {

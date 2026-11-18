@@ -2,8 +2,8 @@ apiVersion: v2
 name: zenlayer-vpc-cni
 description: "The Kubernetes CNI plugin released by Zenlayer"
 type: application
-version: 1.0.0
-appVersion: "v1.0.0"
+version: 2.0.0
+appVersion: "v2.0.0"
 keywords:
   - zenlayer
   - zec

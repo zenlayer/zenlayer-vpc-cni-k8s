@@ -56,7 +56,7 @@ var (
 // Run starts the daemon and blocks until ctx is done. The node-wide file lock
 // is taken first, and given only a few seconds, so a second instance fails to
 // start instead of two daemons managing the same node's interfaces.
-func Run(ctx context.Context) error {
+func Run(ctx context.Context) (retErr error) {
 	err := os.MkdirAll(filepath.Dir(lockFile), 0700)
 	if err != nil {
 		return err
@@ -86,6 +86,9 @@ func Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// NewIpamDaemon reports its own failures; this covers the rest of startup,
+	// such as the wait for a chained plugin's agent in ensureCNIConfig.
+	defer func() { reportStartFailure(ctx, d.k8s, retErr) }()
 
 	log.Info("zenlayer cni daemon ready, start service")
 

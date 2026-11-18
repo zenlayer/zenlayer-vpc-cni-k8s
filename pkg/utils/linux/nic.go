@@ -446,6 +446,13 @@ func EnsureLinkNetConf(name string) error {
 	return errors.Join(failures...)
 }
 
+// EnsureAcceptRAOff refuses router advertisements on one interface the CNI
+// owns. Not part of ipv6NetConfig: that set is also swept over the instance's
+// own interface, whose RA policy belongs to the guest (see AcceptRALeaveAlone).
+func EnsureAcceptRAOff(name string) error {
+	return ensureConf(fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_ra", name), AcceptRAOff)
+}
+
 // EnsureNetConfSet applies both the IPv4 and the IPv6 per-link settings to every
 // interface on the host, unconditionally -- no family gate here, unlike in
 // EnsureHostNsConfig, which calls it.

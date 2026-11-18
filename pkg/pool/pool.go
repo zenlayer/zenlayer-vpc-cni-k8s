@@ -50,7 +50,10 @@ var (
 	ErrResourceInvalid = errors.New("resource state invalid")
 
 	defaultPoolBackoffPeriod = 5 * time.Second
-	maxPoolBackoffPeriod     = 1 * time.Minute
+	// maxTickets bounds the ticket channel; far above any instance's address
+	// capacity.
+	maxTickets           = 1024
+	maxPoolBackoffPeriod = 1 * time.Minute
 )
 
 // ObjectFactory is everything platform-specific about a resource: how to make
@@ -100,6 +103,15 @@ type ObjectFactory interface {
 	// GetResourceLimit is the upper bound on what the platform could supply.
 	// The pool applies its own cap on top; see poolImpl.GetResourceLimit.
 	GetResourceLimit() int
+}
+
+// UsabilityChecker is optionally implemented by an ObjectFactory that can hold
+// a resource which is momentarily unusable, such as an address on an interface
+// its source of truth has stopped listing. The pool keeps such a resource but
+// neither hands it out nor shrinks it away. Called with the pool lock held: it
+// must answer from memory and must not call into the pool.
+type UsabilityChecker interface {
+	Usable(res types.NetResource) bool
 }
 
 // ResourcePool is the allocation surface the daemon uses. Implementations keep
@@ -192,11 +204,29 @@ type poolImpl struct {
 	// concurrency control
 	ticket  chan struct{}
 	backoff time.Duration
+	// ticketsFor is the max cap the tickets were last sized for; see
+	// growTicketsLocked. Under mutex.
+	ticketsFor int
 
 	scale chan struct{}
+	// recheck asks the worker to release p.invalid now; GC sends it when it
+	// left something there, instead of leaving it to the next monitor cycle.
+	recheck chan struct{}
 
 	// ownerAlive is Config.OwnerAlive; see the comment there.
 	ownerAlive func(owner string) bool
+	// usable is the factory's UsabilityChecker, or nil.
+	usable func(types.NetResource) bool
+	// groupSeen is when each releasable group was first seen; see minDrainAge.
+	groupSeen map[string]time.Time
+
+	// createInBackground is Config.CreateInBackground. waiting counts the
+	// Allocates blocked on an empty pool, which the worker adds to its target;
+	// availCh is closed whenever a resource is queued, to wake them. Both
+	// under mutex.
+	createInBackground bool
+	waiting            int
+	availCh            chan struct{}
 
 	// config
 	poolConfigInner
@@ -361,7 +391,26 @@ func (p *poolImpl) addAvailableLocked(res types.NetResource) bool {
 		reserveBefore: time.Now(),
 	})
 	p.metricAvailable.Inc()
+	p.signalAvailableLocked()
 	return true
+}
+
+// availChLocked returns the channel signalAvailableLocked closes next. Caller
+// holds p.mutex.
+func (p *poolImpl) availChLocked() chan struct{} {
+	if p.availCh == nil {
+		p.availCh = make(chan struct{})
+	}
+	return p.availCh
+}
+
+// signalAvailableLocked wakes every Allocate waiting for a resource. Caller
+// holds p.mutex.
+func (p *poolImpl) signalAvailableLocked() {
+	if p.availCh != nil {
+		close(p.availCh)
+		p.availCh = nil
+	}
 }
 
 // capWithLocked returns inUse + available + invalid. Caller must hold p.mutex.
@@ -392,11 +441,7 @@ func (p *poolImpl) allocateFromPool(prefer, owner string) (types.NetResource, er
 		return item.res, nil
 	}
 
-	if p.available.Size() > 0 {
-		item := p.available.PopPrefer(prefer)
-		if item == nil {
-			return nil, apiErr.ErrNotFound
-		}
+	if item := p.available.PopPreferWhere(prefer, p.usableItem, p.allocOrderLocked()); item != nil {
 		if prefer != "" && item.res.GetID() != prefer {
 			lg.Infof("Preferred resource %s no longer in pool, allocated %s instead", prefer, item.res.GetID())
 		}
@@ -412,9 +457,11 @@ func (p *poolImpl) allocateFromPool(prefer, owner string) (types.NetResource, er
 		return res, nil
 	}
 
-	if curCap := p.capWithLocked(); curCap >= p.getMaxCap() {
+	maxCap := p.getMaxCap()
+	p.growTicketsLocked(maxCap)
+	if curCap := p.capWithLocked(); curCap >= maxCap {
 		lg.Warnf("Allocate resource from pool failed: %s (current cap: %d, max cap: %d)",
-			ErrNoResourceAvailable, curCap, p.getMaxCap())
+			ErrNoResourceAvailable, curCap, maxCap)
 		return nil, ErrNoResourceAvailable
 	}
 
@@ -424,6 +471,14 @@ func (p *poolImpl) allocateFromPool(prefer, owner string) (types.NetResource, er
 func (p *poolImpl) Allocate(ctx context.Context, prefer, owner string) (types.NetResource, error) {
 	lg := p.WithFields(zlog.Fields{"prefer": prefer, "owner": owner})
 
+	counted := false
+	defer func() {
+		if counted {
+			p.lock()
+			p.waiting--
+			p.unlock()
+		}
+	}()
 	for {
 		res, err := p.allocateFromPool(prefer, owner)
 		if err == nil {
@@ -431,6 +486,37 @@ func (p *poolImpl) Allocate(ctx context.Context, prefer, owner string) (types.Ne
 		}
 		if !errors.Is(err, ErrNoResourceAvailableInPool) {
 			return nil, err
+		}
+
+		if p.createInBackground {
+			p.lock()
+			if !counted {
+				p.waiting++
+				counted = true
+			}
+			// Something may have been queued between the failed pop and this
+			// lock: its signal found no channel to close, so look before
+			// waiting on a new one.
+			if p.countUsableLocked() > 0 {
+				p.unlock()
+				continue
+			}
+			ch := p.availChLocked()
+			p.unlock()
+			p.notifyScale()
+			// The timer covers what is not signaled: an entry turning usable,
+			// or a GC rebuilding the queue.
+			t := time.NewTimer(defaultPoolBackoffPeriod)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				lg.Infof("Allocate resource return because %s", ErrContextDone)
+				return nil, ErrContextDone
+			case <-ch:
+			case <-t.C:
+			}
+			t.Stop()
+			continue
 		}
 
 		select {
@@ -479,7 +565,8 @@ func (p *poolImpl) Release(resID string) error {
 	item, exist := p.inUse[resID]
 	if !exist {
 		p.unlock()
-		p.Errorf("Find resource %s not exist in pool", resID)
+		// Callers take this as already released; not an error of its own.
+		p.Infof("Resource %s is not in use in the pool", resID)
 		return ErrResourceInvalid
 	}
 	delete(p.inUse, resID)
@@ -493,6 +580,7 @@ func (p *poolImpl) Release(resID string) error {
 			reserveBefore: time.Now(),
 		})
 		p.metricAvailable.Inc()
+		p.signalAvailableLocked()
 		p.unlock()
 		p.Infof("Release resource to pool %s success", resID)
 		return nil
@@ -553,15 +641,17 @@ func (p *poolImpl) Status() Status {
 	p.lock()
 	defer p.unlock()
 
-	cur := p.available.Size()
-	cnt := max(p.getTarget()-cur, 0)
-	cur += len(p.inUse)
+	// Counted as shouldIncrease and popOverflow count: unusable idle entries
+	// hold capacity but are not warm.
+	usable := p.countUsableLocked()
+	cnt := max(p.getTarget()-usable, 0)
+	cur := usable + len(p.inUse)
 	cnt = max(cnt, p.getTargetMin()-cur)
-	cur += len(p.invalid)
+	cur += len(p.invalid) + p.available.Size() - usable
 	cnt = min(cnt, p.getMaxCap()-cur)
 	short := max(0, cnt)
 
-	over := max(p.available.Size()-p.getTarget(), 0)
+	over := max(usable-p.getTarget(), 0)
 	over = max(min(over, cur-p.getTargetMin()), 0)
 
 	return Status{
@@ -606,29 +696,68 @@ out:
 			break out
 		}
 	}
-	cnt := p.getMaxCap() - p.capWithLocked()
+	maxCap := p.getMaxCap()
+	// Over the cap, the tickets the shrink's destroys hand back are owed: count
+	// what is held, so growTicketsLocked takes them back.
+	p.ticketsFor = max(maxCap, p.capWithLocked())
+	cnt := maxCap - p.capWithLocked()
 	for i := 0; i < cnt; i++ {
 		p.productTicket()
+	}
+}
+
+// growTicketsLocked issues tickets for capacity gained since they were last
+// sized. With MaxCapProbe the cap moves at runtime (an interface attached by
+// hand and removed again takes it 28 -> 14 -> 28), and tickets were otherwise
+// resized only by GC: until the next one, up to reconcileIntervalSec later,
+// the pool could not grow and pods stayed in ContainerCreating. A shrink takes
+// back the spare tickets; ones held by creates in flight come back as those
+// finish, and GC resets the count. Caller holds p.mutex.
+func (p *poolImpl) growTicketsLocked(maxCap int) {
+	if maxCap >= p.ticketsFor {
+		for range maxCap - p.ticketsFor {
+			p.productTicket()
+		}
+		p.ticketsFor = maxCap
+		return
+	}
+	// A shrink takes back as many as are spare, or a later regrow issues the
+	// difference again on top of them and Allocate creates past the cap. Only
+	// what was actually taken back comes off: the rest is still out, so the
+	// next call tries again and a regrow issues that much less.
+	for range p.ticketsFor - maxCap {
+		select {
+		case <-p.ticket:
+			p.ticketsFor--
+		default:
+		}
 	}
 }
 
 func (p *poolImpl) shouldIncrease() int {
 	p.lock()
 	defer p.unlock()
-	cur := p.available.Size()
-	cnt := max(p.getTarget()-cur, 0)
+	// Unusable idle entries are not warm stock, but they do hold capacity.
+	cur := p.countUsableLocked()
+	// Waiting Allocates (createInBackground) are demand on top of the target.
+	cnt := max(p.getTarget()+p.waiting-cur, 0)
 	cur += len(p.inUse)
 	cnt = max(cnt, p.getTargetMin()-cur)
-	cur += len(p.invalid)
-	cnt = min(cnt, p.getMaxCap()-cur)
+	cur += len(p.invalid) + p.available.Size() - p.countUsableLocked()
+	maxCap := p.getMaxCap()
+	p.growTicketsLocked(maxCap)
+	cnt = min(cnt, maxCap-cur)
 	return max(0, cnt)
 }
 
-func (p *poolImpl) tryIncreasePool() {
+// tryIncreasePool reports whether the factory failed and the worker should back
+// off. It does not sleep itself: it may run under pauseLock, where a sleep holds
+// off GC and, behind the queued GC, every Release.
+func (p *poolImpl) tryIncreasePool() (backoff bool) {
 	p.Debugf("Try Increase pool")
 	toIncrease := p.shouldIncrease()
 	if toIncrease <= 0 {
-		return
+		return false
 	}
 	toCreate := 0
 	for i := 0; i < toIncrease; i++ {
@@ -643,11 +772,9 @@ func (p *poolImpl) tryIncreasePool() {
 	if toCreate > 0 {
 		res, err := p.factory.Create(toCreate)
 		if err != nil {
+			p.backoffCallFactory()
 			p.Errorf("Create resource failed: %v, backoff: %v", err, p.backoff)
-			defer func() {
-				p.backoffCallFactory()
-				time.Sleep(p.backoff)
-			}()
+			backoff = true
 		}
 		if len(res) == toCreate {
 			p.backoffReset()
@@ -666,37 +793,207 @@ func (p *poolImpl) tryIncreasePool() {
 		}
 		p.Infof("%d resource increased", len(res))
 	}
+	return backoff
 }
 
-func (p *poolImpl) popOverflow() *poolItem {
+// minDrainAge keeps a young group out of the drain order: right after the
+// pool grows onto a new interface, that interface's address is the one most
+// likely to be over target, and draining it would free the interface the next
+// pod start has to create again.
+const minDrainAge = 10 * time.Minute
+
+// popOverflow takes one idle resource to give back, or nil when the pool is not
+// over its targets. skip holds ids whose release already failed in this run.
+func (p *poolImpl) popOverflow(skip map[string]bool) *poolItem {
 	p.lock()
 	defer p.unlock()
 
-	var item *poolItem
-	if (p.available.Size() > p.getTarget() &&
-		p.available.Size()+len(p.inUse) > p.getTargetMin()) ||
-		p.capWithLocked() > p.getMaxCap() {
-		item = p.available.Peek()
+	now := time.Now()
+	p.stampGroupsLocked(now)
+	// Unusable entries cannot be handed out, so they do not count as warm; and
+	// the ones blocked Allocates are about to take are not surplus (the
+	// increase counted them as demand on top of the target).
+	usable := p.countUsableLocked()
+	over := max(min(usable-p.getTarget()-p.waiting, usable+len(p.inUse)-p.getTargetMin()), p.capWithLocked()-p.getMaxCap())
+	if over <= 0 {
+		return nil
 	}
-	if item != nil && item.reserveBefore.Before(time.Now()) {
-		return p.available.Pop()
+	item := p.shrinkCandidateLocked(now, over, skip)
+	if item == nil {
+		return nil
 	}
-	return nil
+	return p.available.Remove(item.res.GetID())
 }
 
-func (p *poolImpl) tryReducePool() {
+// shrinkCandidateLocked picks the idle resource to give back. A releasable
+// group (an interface other than the instance's own) that holds nothing in
+// use, can be emptied within the overflow, and is older than minDrainAge is
+// drained first, so the interface can be released as a whole. Otherwise the
+// oldest idle resource on a secondary interface goes, and the instance's own
+// interface only after those. Caller holds p.mutex.
+func (p *poolImpl) shrinkCandidateLocked(now time.Time, over int, skip map[string]bool) *poolItem {
+	inUse := map[string]int{}
+	for _, it := range p.inUse {
+		if g, ok := shrinkGroup(it.res); ok {
+			inUse[g]++
+		}
+	}
+	idle := map[string]int{}      // every idle entry of the group
+	drainable := map[string]int{} // the ones this run may take
+	// Without a group to drain, the instance's own interface keeps its idle
+	// addresses longest: giving them back first strands the warm addresses on
+	// a secondary interface that can then never be emptied and released.
+	// Secondaries older than minDrainAge go before younger ones.
+	tier := func(it *poolItem) int {
+		g, grouped := shrinkGroup(it.res)
+		switch {
+		case !grouped:
+			return 2
+		case now.Sub(p.groupSeen[g]) < minDrainAge:
+			return 1
+		default:
+			return 0
+		}
+	}
+	var oldest *poolItem
+	oldestTier := 0
+	for _, it := range p.available.innerQueue {
+		g, grouped := shrinkGroup(it.res)
+		if grouped {
+			idle[g]++
+		}
+		if !it.reserveBefore.Before(now) || !p.usableItem(it) || skip[it.res.GetID()] {
+			continue
+		}
+		if grouped {
+			drainable[g]++
+		}
+		t := tier(it)
+		if oldest == nil || t < oldestTier || (t == oldestTier && it.reserveBefore.Before(oldest.reserveBefore)) {
+			oldest, oldestTier = it, t
+		}
+	}
+	target := ""
+	for g, n := range idle {
+		if inUse[g] > 0 || drainable[g] != n || n > over || now.Sub(p.groupSeen[g]) < minDrainAge {
+			continue
+		}
+		if target == "" || n < idle[target] || (n == idle[target] && g < target) {
+			target = g
+		}
+	}
+	if target == "" {
+		return oldest
+	}
+	var pick *poolItem
+	for _, it := range p.available.innerQueue {
+		if g, _ := shrinkGroup(it.res); g == target && (pick == nil || it.reserveBefore.Before(pick.reserveBefore)) {
+			pick = it
+		}
+	}
+	return pick
+}
+
+// stampGroupsLocked records when each releasable group was first seen and
+// forgets the ones gone. Caller holds p.mutex.
+func (p *poolImpl) stampGroupsLocked(now time.Time) {
+	present := map[string]bool{}
+	mark := func(res types.NetResource) {
+		if g, ok := shrinkGroup(res); ok {
+			present[g] = true
+		}
+	}
+	for _, it := range p.inUse {
+		mark(it.res)
+	}
+	for _, it := range p.available.innerQueue {
+		mark(it.res)
+	}
+	if p.groupSeen == nil {
+		p.groupSeen = map[string]time.Time{}
+	}
+	for g := range present {
+		if _, ok := p.groupSeen[g]; !ok {
+			p.groupSeen[g] = now
+		}
+	}
+	for g := range p.groupSeen {
+		if !present[g] {
+			delete(p.groupSeen, g)
+		}
+	}
+}
+
+// allocOrderLocked orders idle entries for handing out: the instance's own
+// interface first, since it is never released, then the secondary with the
+// most addresses in use. Packing pods onto few interfaces leaves the others
+// idle, so the shrink path can release them whole. Caller holds p.mutex.
+func (p *poolImpl) allocOrderLocked() func(a, b *poolItem) bool {
+	inUse := map[string]int{}
+	for _, it := range p.inUse {
+		if g, ok := shrinkGroup(it.res); ok {
+			inUse[g]++
+		}
+	}
+	return func(a, b *poolItem) bool {
+		ga, oka := shrinkGroup(a.res)
+		gb, okb := shrinkGroup(b.res)
+		if oka != okb {
+			return !oka
+		}
+		return oka && inUse[ga] > inUse[gb]
+	}
+}
+
+// countUsableLocked counts the idle entries that can be handed out. Caller
+// holds p.mutex.
+func (p *poolImpl) countUsableLocked() int {
+	if p.usable == nil {
+		return p.available.Size()
+	}
+	n := 0
+	for _, it := range p.available.innerQueue {
+		if p.usableItem(it) {
+			n++
+		}
+	}
+	return n
+}
+
+// shrinkGroup returns the group a resource is released with, and false when it
+// has none or its group can never be released.
+func shrinkGroup(res types.NetResource) (string, bool) {
+	g, ok := res.(types.Grouped)
+	if !ok {
+		return "", false
+	}
+	return g.ShrinkGroup()
+}
+
+// usableItem applies the factory's UsabilityChecker. Caller holds p.mutex.
+func (p *poolImpl) usableItem(it *poolItem) bool {
+	return p.usable == nil || p.usable(it.res)
+}
+
+// tryReducePool reports whether a release failed and the worker should back
+// off; like tryIncreasePool it does not sleep under pauseLock. A failed resource
+// is skipped for the rest of the run rather than waited on.
+func (p *poolImpl) tryReducePool() (backoff bool) {
 	p.Debugf("Try Reduce pool")
 	var reAvailable []types.NetResource
 	// Bound the loop: a resource that fails to release goes back into
 	// available, where popOverflow picks it up again. Without a cap that is an
 	// endless (backoff-paced) loop which starves the rest of the worker.
 	maxAttempts := p.getMaxCap() + 1
+	// A resource whose release failed is not picked again in this run: the
+	// drain order is deterministic and would retry it on every attempt.
+	failed := map[string]bool{}
 	for attempt := 0; ; attempt++ {
 		if attempt >= maxAttempts {
 			p.Warnf("Reduce pool stopped after %d attempts, will retry next cycle", attempt)
 			break
 		}
-		item := p.popOverflow()
+		item := p.popOverflow(failed)
 		if item == nil {
 			break
 		}
@@ -718,15 +1015,17 @@ func (p *poolImpl) tryReducePool() {
 			reAvailable = append(reAvailable, item.res)
 		} else {
 			p.Warnf("Destroy resource %v failed: %v, backoff: %v", item.res, err, p.backoff)
+			failed[item.res.GetID()] = true
 			p.backoffCallFactory()
 			p.AddAvailable(item.res)
-			time.Sleep(p.backoff)
+			backoff = true
 		}
 	}
 
 	for _, res := range reAvailable {
 		p.AddAvailable(res)
 	}
+	return backoff
 }
 
 func (p *poolImpl) checkInvalid() {
@@ -867,17 +1166,34 @@ func (p *poolImpl) worker() {
 			defer runtime.HandleCrash(func(r interface{}) {
 				p.Errorf("Pool worker panicked: %v", r)
 			})
+			paused := func(f func()) {
+				p.blockPause()
+				defer p.unblockPause()
+				f()
+			}
+			// With createInBackground, Create may wait a minute on another
+			// party; held under pauseLock that would queue a GC, and every
+			// Release behind it. The factory must then cope with a GC landing
+			// mid-Create (crd's does: it does not adopt what a Create awaits),
+			// and AddAvailable drops what GC has already queued.
+			increase := func() (b bool) { paused(func() { b = p.tryIncreasePool() }); return b }
+			if p.createInBackground {
+				increase = p.tryIncreasePool
+			}
+			wait := false
 			select {
 			case <-p.scale:
-				p.blockPause()
-				defer p.unblockPause()
-				p.tryIncreasePool()
+				wait = increase()
+			case <-p.recheck:
+				paused(p.checkInvalid)
 			case <-cycle:
-				p.blockPause()
-				defer p.unblockPause()
-				p.checkInvalid()
-				p.tryIncreasePool()
-				p.tryReducePool()
+				paused(p.checkInvalid)
+				wait = increase()
+				paused(func() { wait = p.tryReducePool() || wait })
+			}
+			// Back off here, with pauseLock released.
+			if wait {
+				time.Sleep(p.backoff)
 			}
 		}()
 	}
@@ -959,16 +1275,26 @@ func (p *poolImpl) GC(getAllocatedResMap func() (map[string]types.NetResourceAll
 		}
 	}
 
-	p.invalid = map[string]poolItem{}
-	for id, item := range list[types.ResStatusInvalid] {
-		if _, exist := p.inUse[id]; !exist {
-			p.invalid[id] = poolItem{
-				res: item,
-			}
+	// An address a pod holds is never given back, even when the factory lists
+	// it under another ID than the pod's record: an interface rebuilt after
+	// it dropped out of a describe re-adopts its pods' IPv4 alone, and on a
+	// dual-stack node that ID (eni/<v4>) is not the record's (eni/<v4>-<v6>).
+	heldV4 := map[string]bool{}
+	for _, item := range p.inUse {
+		if v4 := item.res.GetResourceItem().IPv4; v4 != "" {
+			heldV4[v4] = true
 		}
 	}
-	for id, item := range list[types.ResStatusLegacy] {
-		if _, exist := p.inUse[id]; !exist {
+	p.invalid = map[string]poolItem{}
+	for _, status := range []types.ResStatus{types.ResStatusInvalid, types.ResStatusLegacy} {
+		for id, item := range list[status] {
+			if _, exist := p.inUse[id]; exist {
+				continue
+			}
+			if v4 := item.GetResourceItem().IPv4; v4 != "" && heldV4[v4] {
+				p.Infof("Keeping %s: its address is held by a pod under another record", id)
+				continue
+			}
 			p.invalid[id] = poolItem{
 				res: item,
 			}
@@ -978,6 +1304,14 @@ func (p *poolImpl) GC(getAllocatedResMap func() (map[string]types.NetResourceAll
 	oldAvailable := p.available.Dump()
 	p.available = newPriorityQueue()
 	for id, item := range list[types.ResStatusNormal] {
+		if v4 := item.GetResourceItem().IPv4; v4 != "" && heldV4[v4] {
+			if _, own := p.inUse[id]; !own {
+				// Same address as a pod's record under another ID: queuing it
+				// would hand the pod's address to a second pod.
+				p.Warnf("Not queuing %s: its address is held by a pod under another record", id)
+			}
+			continue
+		}
 		if _, exist := p.inUse[id]; !exist {
 			poolRes := poolItem{
 				res: item,
@@ -992,6 +1326,13 @@ func (p *poolImpl) GC(getAllocatedResMap func() (map[string]types.NetResourceAll
 	p.metricAvailable.Set(float64(p.available.Size()))
 	p.metricTotal.Set(float64(p.capWithLocked()))
 	p.resetTicketWithLocked()
+	p.signalAvailableLocked()
+	if len(p.invalid) > 0 {
+		select {
+		case p.recheck <- struct{}{}:
+		default:
+		}
+	}
 
 	p.WithFields(zlog.Fields{"phase": "after gc"}).Debugf("Inuse items in pool: %v", p.inUse)
 	p.WithFields(zlog.Fields{"phase": "after gc"}).Debugf("Available items in pool: %v", p.available.Dump())
@@ -1010,24 +1351,31 @@ func (p *poolImpl) ReCfgCache(target, targetMin int) {
 // set, and starts the background worker that keeps the pool sized.
 func NewResourcePool(config Config) (ResourcePool, error) {
 	impl := &poolImpl{
-		name:            config.Name,
-		resType:         config.Type,
-		inUse:           make(map[string]poolItem),
-		available:       newPriorityQueue(),
-		invalid:         make(map[string]poolItem),
-		factory:         config.Factory,
-		mutex:           sync.Mutex{},
-		pauseLock:       sync.RWMutex{},
-		backoff:         defaultPoolBackoffPeriod,
-		scale:           make(chan struct{}, 1),
-		ownerAlive:      config.OwnerAlive,
-		poolConfigInner: config.newPoolConfigInner(),
-		metricAvailable: metrics.ResourcePoolAvailable.WithLabelValues(config.Name, config.Type),
-		metricTotal:     metrics.ResourcePoolTotal.WithLabelValues(config.Name, config.Type),
-		Logger:          log.WithFields(zlog.Fields{"pool": config.Name, "factory": config.Factory.Name()}),
+		name:               config.Name,
+		resType:            config.Type,
+		inUse:              make(map[string]poolItem),
+		available:          newPriorityQueue(),
+		invalid:            make(map[string]poolItem),
+		factory:            config.Factory,
+		mutex:              sync.Mutex{},
+		pauseLock:          sync.RWMutex{},
+		backoff:            defaultPoolBackoffPeriod,
+		scale:              make(chan struct{}, 1),
+		recheck:            make(chan struct{}, 1),
+		ownerAlive:         config.OwnerAlive,
+		createInBackground: config.CreateInBackground,
+		poolConfigInner:    config.newPoolConfigInner(),
+		metricAvailable:    metrics.ResourcePoolAvailable.WithLabelValues(config.Name, config.Type),
+		metricTotal:        metrics.ResourcePoolTotal.WithLabelValues(config.Name, config.Type),
+		Logger:             log.WithFields(zlog.Fields{"pool": config.Name, "factory": config.Factory.Name()}),
+	}
+	if u, ok := config.Factory.(UsabilityChecker); ok {
+		impl.usable = u.Usable
 	}
 	maxCp := impl.getMaxCap()
-	impl.ticket = make(chan struct{}, maxCp)
+	// Room for more than today's cap: a probed cap can grow later, and a full
+	// channel silently drops the tickets growTicketsLocked issues.
+	impl.ticket = make(chan struct{}, max(maxCp, maxTickets))
 	impl.metricTarget.Set(float64(impl.target))
 	impl.metricTargetMin.Set(float64(impl.targetMin))
 
@@ -1040,7 +1388,7 @@ func NewResourcePool(config Config) (ResourcePool, error) {
 
 	err := impl.init()
 	if err != nil {
-		return nil, fmt.Errorf("resource pool %s init failed: %v", config.Name, err)
+		return nil, fmt.Errorf("resource pool %s init failed: %w", config.Name, err)
 	}
 	go impl.worker()
 	log.WithFields(zlog.Fields{

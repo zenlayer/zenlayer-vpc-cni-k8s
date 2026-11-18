@@ -10,8 +10,10 @@ import (
 	"math"
 	"math/big"
 	"net"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -26,6 +28,7 @@ import (
 	"github.com/zenlayer/zenlayer-vpc-cni-k8s/pkg/k8s"
 	"github.com/zenlayer/zenlayer-vpc-cni-k8s/pkg/pool"
 	"github.com/zenlayer/zenlayer-vpc-cni-k8s/pkg/signal"
+	"github.com/zenlayer/zenlayer-vpc-cni-k8s/pkg/tracing"
 	pkgUtils "github.com/zenlayer/zenlayer-vpc-cni-k8s/pkg/utils"
 	apiErr "github.com/zenlayer/zenlayer-vpc-cni-k8s/pkg/zapi/errors"
 	zecTypes "github.com/zenlayer/zenlayer-vpc-cni-k8s/types"
@@ -50,6 +53,9 @@ var ErrLegacy = errors.New("legacy resource")
 // interface.
 type eniIPResourceManager struct {
 	pool pool.ResourcePool
+	// factory is the direct-mode factory, for hooks the daemon wires after
+	// construction; nil in crd mode.
+	factory *eniIPFactory
 }
 
 func (m *eniIPResourceManager) Name() string {
@@ -68,6 +74,12 @@ func (m *eniIPResourceManager) Allocate(ctx *netContext, prefer string) (zecType
 
 func (m *eniIPResourceManager) Release(ctx *netContext, resource *zecTypes.ResourceItem) error {
 	err := m.pool.Release(resource.ID)
+	if errors.Is(err, pool.ErrResourceInvalid) {
+		// Callers treat it as already released: an address the pool never
+		// held, e.g. one on an interface this node no longer manages.
+		ctx.Log().Infof("Release %v: not held by the pool, nothing to give back", resource)
+		return err
+	}
 	if err != nil {
 		ctx.Log().Errorf("Release %v failed, %v", resource, err)
 		return err
@@ -223,12 +235,12 @@ func newEniIPResourceManager(cfg *config.Config, subnet helper.SubnetManager, se
 
 	created, err := zecAPI.GetAttachedENIs()
 	if err != nil {
-		return nil, fmt.Errorf("get attached enis failed while init, %v", err)
+		return nil, fmt.Errorf("get attached enis failed while init, %w", err)
 	}
 
 	eniFact, err := newEniFactory(secManager, subnet, zecAPI, limit, types.IPStack(cfg.IPStack))
 	if err != nil {
-		return nil, fmt.Errorf("create eni factory failed, %v", err)
+		return nil, fmt.Errorf("create eni factory failed, %w", err)
 	}
 
 	// instanceLimitPeriod, not the reconcile interval: see that constant for why
@@ -243,7 +255,9 @@ func newEniIPResourceManager(cfg *config.Config, subnet helper.SubnetManager, se
 		eniIpReceiver: make(chan *ENIIPRes, defaultOrderCnt),
 		eniPending:    make(chan struct{}, defaultEniPending),
 		ipStack:       types.IPStack(cfg.IPStack),
+		loggedLimit:   -1,
 	}
+	m.factory = factory
 	poolConfig.Factory = factory
 	// The second opinion GC needs when a stored record is missing but its pod is
 	// not. The informer cache answers first because it costs nothing, and a
@@ -256,60 +270,9 @@ func newEniIPResourceManager(cfg *config.Config, subnet helper.SubnetManager, se
 		return ownerStillExists(k8s, owner)
 	}
 	poolConfig.PreStart = func(pool pool.ResourcePoolOp) error {
-		// Which addresses are actually in use, according to the API server.
-		//
-		// The stored records are the primary source but not the only authority:
-		// if the store is lost, every address on a managed ENI looks unclaimed
-		// and would be pooled as free, live pods' included. Failing here is
-		// deliberate -- a failed start is retried by the kubelet, a duplicated
-		// address is not recoverable on its own.
-		livePodByIP := map[string]string{}
-		livePodV6 := map[string]net.IP{}
-		localPods, listErr := k8s.ListLocalPods(context.Background())
-		if listErr != nil {
-			return fmt.Errorf("list pods of this node to identify addresses already in use: %w", listErr)
-		}
-		for _, p := range localPods {
-			if p == nil || p.Spec.HostNetwork {
-				continue
-			}
-			// A pod that finished long enough ago is not holding anything: its
-			// sandbox is gone, its DEL has run, and Status.PodIPs is a record of
-			// what it had rather than a claim on it. Leaving it in would
-			// attribute the address to it again on this restart, and OwnerAlive
-			// would then keep it there for as long as the Pod object exists.
-			if finishedLongerThan(p, podTerminalGrace) {
-				log.Infof("Pod %s finished more than %v ago; not treating %v as still held by it",
-					zecTypes.PodKey(p.Namespace, p.Name), podTerminalGrace, p.Status.PodIPs)
-				continue
-			}
-			// PodIPs, not PodIP: on a dual-stack pod PodIP is only PodIPs[0],
-			// so indexing by it alone leaves the IPv6 half of every pod
-			// invisible here -- and with the record store lost, this index is
-			// what stops the rebuilt pool from handing a live pod's address to
-			// a second pod. PodIPs is empty on older objects, so fall back to
-			// PodIP.
-			ips := make([]string, 0, 2)
-			for _, ip := range p.Status.PodIPs {
-				if ip.IP != "" {
-					ips = append(ips, ip.IP)
-				}
-			}
-			if len(ips) == 0 && p.Status.PodIP != "" {
-				ips = append(ips, p.Status.PodIP)
-			}
-			for _, ip := range ips {
-				livePodByIP[ip] = zecTypes.PodKey(p.Namespace, p.Name)
-			}
-			// The same index the other way round. Recovering a pod needs the
-			// address that actually goes with the one found, and only the API
-			// server knows the pairing -- the platform publishes no per-address
-			// IPv6 view, so a locally carved counterpart is a guess.
-			for _, ip := range ips {
-				if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
-					livePodV6[zecTypes.PodKey(p.Namespace, p.Name)] = parsed
-				}
-			}
+		livePodByIP, livePodV6, err := livePodAddresses(k8s)
+		if err != nil {
+			return err
 		}
 
 		for _, eni := range created {
@@ -317,13 +280,16 @@ func newEniIPResourceManager(cfg *config.Config, subnet helper.SubnetManager, se
 			// must never enter the pool.
 			v4s, v6Net, inErr := zecAPI.GetENIAllocatableIPs(eni)
 			if inErr != nil {
-				return fmt.Errorf("get ip list on eni %s failed, %v", eni.Mac.String(), inErr)
+				return fmt.Errorf("get ip list on eni %s failed, %w", eni.Mac.String(), inErr)
 			}
-			if factory.ipStack.EnableIPv6() && v6Net == nil {
+			// An excluded primary serves no pod, so it needs no prefix -- and
+			// asking for one bills it, or fails the start outright when its
+			// subnet has no IPv6.
+			if factory.ipStack.EnableIPv6() && v6Net == nil && !factory.excludedENI(eni) {
 				var primaryV6 net.IP
 				v6Net, primaryV6, inErr = zecAPI.GetOrAssignIPv6Block(eni.ID, eni.Mac.String())
 				if inErr != nil {
-					return fmt.Errorf("get or assign IPv6 block on eni %s failed, %v", eni.Mac.String(), inErr)
+					return fmt.Errorf("get or assign IPv6 block on eni %s failed, %w", eni.Mac.String(), inErr)
 				}
 				// The describe that produced the prefix also names the
 				// interface's own primary IPv6, which falls inside it. Record it
@@ -344,253 +310,8 @@ func newEniIPResourceManager(cfg *config.Config, subnet helper.SubnetManager, se
 			}
 			factory.appendEniLocked(fEni)
 
-			v4sMap := pkgUtils.NetIPToMap(v4s)
-			for _, item := range allocatedResource {
-				if item.Resource.GetResourceItem().ENIId != eni.ID {
-					continue
-				}
-				ipSet := zecTypes.IPSet{
-					IPv4: net.ParseIP(item.Resource.GetResourceItem().IPv4),
-					IPv6: net.ParseIP(item.Resource.GetResourceItem().IPv6),
-				}
-				// The IPv4 leaves the "unclaimed" set on the strength of the
-				// record, before any family is stripped -- the address is taken
-				// whatever stack this daemon now runs.
-				if ipSet.IPv4 != nil {
-					delete(v4sMap, ipSet.IPv4.String())
-				}
-
-				// Strip to the families in use first, then give the same object
-				// to both the pool and the factory. IPSet is a value and GetID()
-				// folds the addresses in, so registering an unstripped copy
-				// keys the two sides differently ("eni/<v4>-<v6>" vs
-				// "eni/<v4>"). Identical on a dual node; on a node switched back
-				// to ipv4 it makes pool.GC push a live pod's address into
-				// available. Switching the stack is supported.
-				if !factory.ipStack.EnableIPv4() {
-					ipSet.IPv4 = nil
-				}
-				if !factory.ipStack.EnableIPv6() {
-					ipSet.IPv6 = nil
-				}
-				// A record naming the interface's own primary is corrupt, and
-				// registering it is worse than losing it. It cannot be a pod's
-				// address -- the guest has it configured on the interface -- so
-				// the pod this record belongs to is not actually using it, and
-				// keeping the record only puts the address somewhere a later
-				// release can hand it to a pod that then black-holes.
-				//
-				// Dropped here rather than marked: a marked record still enters
-				// the pool, occupies a slot and inflates resource_pool_total
-				// until something reclaims it, and the reclaim path for a
-				// primary is a no-op by design. Nothing downstream wants it.
-				if namesInterfacePrimary(eni, ipSet) {
-					log.Warnf("Stored record for pod %s names eni %s's own primary address (%s); "+
-						"dropping it -- an address configured on the interface cannot also be a pod's",
-						item.Owner, eni.ID, ipSet.String())
-					continue
-				}
-				var resErr error
-				if (factory.ipStack.EnableIPv4() && ipSet.IPv4 == nil) ||
-					(factory.ipStack.EnableIPv6() && ipSet.IPv6 == nil) {
-					resErr = ErrLegacy
-				}
-				eniIP := &zecTypes.ENIIP{
-					ENI:   eni,
-					IPSet: ipSet,
-				}
-				pool.AddInuse(eniIP, item.Owner)
-				fEni.appendIPLocked(&ENIIPRes{
-					ENIIP: eniIP,
-					err:   resErr,
-				})
-			}
-
-			if factory.ipStack.EnableIPv4() && !factory.ipStack.EnableIPv6() {
-				// What remains in v4sMap are addresses the platform reports on a
-				// managed ENI that no stored pod claims. Adopting them is what
-				// lets an address survive a restart -- the platform still counts
-				// it against the per-NIC quota, so leaving it shrinks the node's
-				// capacity on every restart.
-				//
-				// This includes the instance's own interface (its primary is
-				// already excluded by GetENIAllocatableIPs), so an address an
-				// operator attached by hand is adoptable too -- the accepted
-				// cost of having no per-address ownership tag.
-				for _, ipv4 := range v4sMap {
-					eniIP := &ENIIPRes{
-						ENIIP: &zecTypes.ENIIP{
-							ENI: eni,
-							IPSet: zecTypes.IPSet{
-								IPv4: ipv4,
-							},
-						},
-					}
-					fEni.appendIPLocked(eniIP)
-					// A pod on this node is holding this address even though no
-					// stored record mentions it -- the record was lost. Take the
-					// API server's word for it and mark the address in use, or
-					// the next pod scheduled here would be given an address that
-					// is already carrying traffic.
-					if owner, held := livePodByIP[ipv4.String()]; held {
-						log.Warnf("Address %s on eni %s is held by pod %s but has no stored record; recovering it as in-use",
-							ipv4, eni.ID, owner)
-						pool.AddInuse(eniIP.ENIIP, owner)
-						continue
-					}
-					pool.AddAvailable(eniIP.ENIIP) // no need to deal with ipv6
-				}
-			} else if !factory.ipStack.EnableIPv4() && factory.ipStack.EnableIPv6() {
-				fEni.Lock()
-				v6List, err := fEni.AllocateIPv6AddressLocked(poolConfig.MaxCap)
-				fEni.Unlock()
-				if err != nil {
-					return fmt.Errorf("allocate IPv6 address from ipv6 cidr %v of eni %s  failed, %v", v6Net.String(), fEni.ID, err)
-				}
-				for _, ipv6 := range v6List {
-					eniIP := &ENIIPRes{
-						ENIIP: &zecTypes.ENIIP{
-							ENI: eni,
-							IPSet: zecTypes.IPSet{
-								IPv6: ipv6,
-							},
-						},
-					}
-					fEni.appendIPLocked(eniIP)
-					pool.AddAvailable(eniIP.ENIIP) // no need to deal with ipv4
-				}
-			} else {
-				var v4List []net.IP
-				for _, v4 := range v4sMap {
-					v4List = append(v4List, v4)
-				}
-				// Nothing to pair is the common case, not an error: v4sMap holds
-				// only the addresses the platform reports that no stored record
-				// claims, and on a freshly started node with an intact record
-				// store -- or on a primary interface carrying nothing but the
-				// node's own address, which GetENIAllocatableIPs filters out --
-				// that set is empty. AllocateIPv6AddressLocked rejects a count
-				// of zero, so calling it unconditionally failed PreStart, and a
-				// failed PreStart takes the whole daemon down. Every dual node
-				// would have CrashLooped on its first start.
-				if len(v4List) == 0 {
-					go fEni.worker(factory.eniIpReceiver)
-					continue
-				}
-				// Pair from what the API server says, not from carve order.
-				// Zipping freshly carved addresses against v4List pairs them at
-				// random (v4List comes from ranging a map), and on this path --
-				// a lost record store with pods still running -- the carve can
-				// reproduce an address a live pod already holds. livePodV6 knows
-				// the real pairing: use it, reserve the live addresses first, and
-				// carve only for what no live pod claims.
-				fEni.Lock()
-				// Only the ones e.ips does not already carry. A live pod whose
-				// stored record survived was appended above, which spent any
-				// reservation for it -- reserving it again here would leave an
-				// entry nothing can ever spend, which takes the address out of
-				// the prefix for the life of the interface.
-				held := make(map[string]struct{}, len(fEni.ips))
-				for _, rec := range fEni.ips {
-					if rec.IPSet.IPv6 != nil {
-						held[rec.IPSet.IPv6.String()] = struct{}{}
-					}
-				}
-				var liveV6 []net.IP
-				for _, v6 := range livePodV6 {
-					if fEni.IPv6Net == nil || !fEni.IPv6Net.Contains(v6) {
-						continue
-					}
-					if _, ok := held[v6.String()]; ok {
-						continue
-					}
-					liveV6 = append(liveV6, v6)
-				}
-				fEni.reserveV6Locked(liveV6)
-				fEni.Unlock()
-
-				type recovered struct {
-					v4    net.IP
-					v6    net.IP
-					owner string
-				}
-				items := make([]recovered, 0, len(v4List))
-				carveFor := 0
-				for _, v4 := range v4List {
-					it := recovered{v4: v4}
-					if owner, ok := livePodByIP[v4.String()]; ok {
-						it.owner = owner
-						if v6 := livePodV6[owner]; v6 != nil && fEni.IPv6Net != nil && fEni.IPv6Net.Contains(v6) {
-							it.v6 = v6
-						}
-					}
-					if it.v6 == nil && it.owner == "" {
-						carveFor++
-					}
-					items = append(items, it)
-				}
-
-				var carved []net.IP
-				if carveFor > 0 {
-					fEni.Lock()
-					carved, err = fEni.AllocateIPv6AddressLocked(carveFor)
-					fEni.Unlock()
-					if err != nil {
-						return fmt.Errorf("allocate IPv6 address from ipv6 cidr %v of eni %s failed, %v", v6Net.String(), fEni.ID, err)
-					}
-				}
-
-				next := 0
-				for _, it := range items {
-					if it.v6 == nil && it.owner == "" {
-						it.v6 = carved[next]
-						next++
-					}
-					eniIP := &ENIIPRes{
-						ENIIP: &zecTypes.ENIIP{
-							ENI:   eni,
-							IPSet: zecTypes.IPSet{IPv4: it.v4, IPv6: it.v6},
-						},
-					}
-					// An incomplete set is marked, exactly as the stored-record
-					// arm above marks one. Without it Valid() returns nil, so
-					// pool.Release skips ReleaseInValid and pushes the half set
-					// onto the available queue -- and factory.List classifies it
-					// Normal, because it checks a family only when that family
-					// is present, so every later reconcile re-queues it too.
-					// Either way the next pod on a dual node comes up with no
-					// IPv6 and nothing ever repairs the entry.
-					if it.v6 == nil {
-						eniIP.err = ErrLegacy
-					}
-					if it.owner == "" {
-						fEni.appendIPLocked(eniIP)
-						pool.AddAvailable(eniIP.ENIIP)
-						continue
-					}
-					// A live pod claims this address. Recover it as in-use so
-					// the next pod scheduled here is not given an address that
-					// is already carrying traffic.
-					if it.v6 == nil {
-						// The pod holds this IPv4 but no IPv6 out of this
-						// interface's prefix. Record what is true rather than
-						// inventing a counterpart: an invented one would be
-						// configured on no interface, and releasing the resource
-						// instead would unassign the address the pod is using.
-						// Being in use does not keep it out of the available
-						// queue: pool.GC moves an in-use entry there once its
-						// record is gone and its owner is not alive. The
-						// ErrLegacy stamped above does -- Valid returns it and
-						// List files the entry under Legacy.
-						log.Warnf("Pod %s holds address %s on eni %s with no ipv6 from this interface's prefix; recovering the ipv4 alone",
-							it.owner, it.v4, eni.ID)
-					} else {
-						log.Warnf("Address set %s on eni %s is held by pod %s but has no stored record; recovering it as in-use",
-							eniIP.IPSet.String(), eni.ID, it.owner)
-					}
-					fEni.appendIPLocked(eniIP)
-					pool.AddInuse(eniIP.ENIIP, it.owner)
-				}
+			if err := seedENIAddresses(pool, fEni, v4s, factory.ipStack, allocatedResource, livePodByIP, livePodV6, poolConfig.MaxCap); err != nil {
+				return err
 			}
 			go fEni.worker(factory.eniIpReceiver)
 		}
@@ -598,7 +319,7 @@ func newEniIPResourceManager(cfg *config.Config, subnet helper.SubnetManager, se
 	}
 	p, err := pool.NewResourcePool(poolConfig)
 	if err != nil {
-		return nil, fmt.Errorf("create resource pool %s failed, %v", poolConfig.Name, err)
+		return nil, fmt.Errorf("create resource pool %s failed, %w", poolConfig.Name, err)
 	}
 	// Started only once the pool exists, because NewResourcePool is what runs
 	// PreStart, and PreStart builds f.enis without holding f.Lock -- correctly,
@@ -736,6 +457,14 @@ const (
 	// that result blocks forever holding blockPause, which also stops GC.
 	// Nothing clears this bit.
 	forbidRetired
+
+	// forbidNotPodSubnet: an interface in a subnet outside the configured pod
+	// subnets, from which alone pod addresses come (see excludedENI). Fixed for
+	// the daemon's run, since the subnets are read at startup. Every address on
+	// it is Legacy (see excludedLocked): a pod keeps its own, the pool gives the
+	// rest back. Unrecorded ones are taken IPv4 alone, nothing carved -- except
+	// on the instance's primary, where they may be an operator's and are left.
+	forbidNotPodSubnet
 )
 
 // forbidNone is the empty set: the interface is eligible.
@@ -754,6 +483,9 @@ func (r forbidReason) String() string {
 	}
 	if r&forbidRetired != 0 {
 		parts = append(parts, "interface is being retired")
+	}
+	if r&forbidNotPodSubnet != 0 {
+		parts = append(parts, "interface outside the pod subnets")
 	}
 	return strings.Join(parts, "; ")
 }
@@ -1017,6 +749,7 @@ func (e *ENI) worker(resultCache chan<- *ENIIPRes) {
 			case subnetCodes.WithErrCodes(
 				apiErr.InsufficientIpInSubnet,
 				apiErr.OPERATION_DENIED_SUBNET_IP_INSUFFICIENT,
+				apiErr.INVALID_SUBNET_IPV4_INSUFFICIENT,
 			).ErrChainEqual(err):
 				e.Lock()
 				e.forbidAssign |= forbidSubnet
@@ -1302,6 +1035,14 @@ type eniIPFactory struct {
 	eniIpReceiver chan *ENIIPRes
 	eniPending    chan struct{}
 	ipStack       types.IPStack
+	// loggedLimit is the last limit GetResourceLimit logged, so a change is
+	// logged once rather than on every device plugin poll; -1 until the first,
+	// so a node starting at 0 logs it too. Guarded by the factory lock.
+	loggedLimit int
+	// onCapacity, when set, is told that the limit may have moved outside a
+	// pod's own release (an address on an interface taking no new ones given
+	// back by the pool's invalid queue or its shrink).
+	onCapacity atomic.Pointer[func()]
 }
 
 func (f *eniIPFactory) Name() string {
@@ -1384,6 +1125,12 @@ func (f *eniIPFactory) submitOrder() error {
 			continue
 		}
 		eni.Lock()
+		if eni.forbidAssign&forbidNotPodSubnet != 0 {
+			// Outside the pod subnets: no order goes here whatever its stack,
+			// and checking the stack would warn about it on every order.
+			eni.Unlock()
+			continue
+		}
 		subnet := f.eniFactory.subnets.GetPodSubnet(eni.Subnet.ID)
 		if subnet == nil {
 			log.Errorf("Get subnet %s of eni %s from subnetManager failed, not found", eni.Subnet.ID, eni.ID)
@@ -1453,6 +1200,17 @@ func (f *eniIPFactory) appendEniLocked(eni *ENI) *ENI {
 		if id != "" && id == eni.GetID() {
 			return old
 		}
+	}
+	// Marked once, as the interface joins: GC passes every attached interface
+	// through here again, and would repeat the event on each pass.
+	if f.excludedENI(eni.ENI) {
+		eni.Lock()
+		eni.forbidAssign |= forbidNotPodSubnet
+		eni.Unlock()
+		msg := fmt.Sprintf("Interface %s is in subnet %s, not one of the pod subnets: it serves no new pod, "+
+			"and pod addresses come only from interfaces in the pod subnets", eni.ID, eni.Subnet.ID)
+		log.Info(msg)
+		_ = tracing.RecordNodeEvent(corev1.EventTypeNormal, tracing.EventENIExcluded, msg)
 	}
 	f.enis = append(f.enis, eni)
 	return eni
@@ -1868,8 +1626,14 @@ func (f *eniIPFactory) ReleaseInValid(resource zecTypes.NetResource) (zecTypes.N
 			return nil, fmt.Errorf("dealloc ip address failed, %v", err)
 		}
 		temp.Lock()
+		forbidden := temp.forbidAssign != forbidNone
 		temp.deleteIPLocked(res)
 		temp.Unlock()
+		// On an interface taking no new addresses this lowers the limit
+		// (GetResourceLimit counts what it can still contribute).
+		if fn := f.onCapacity.Load(); forbidden && fn != nil {
+			(*fn)()
+		}
 		return nil, nil
 	}
 
@@ -2004,8 +1768,13 @@ outLoop:
 		return fmt.Errorf("dealloc ipaddress failed, %v", err)
 	}
 	eni.Lock()
+	forbidden := eni.forbidAssign != forbidNone
 	eni.deleteIPLocked(eniIP)
 	eni.Unlock()
+	// As in ReleaseInValid: the pool's shrink lands here too.
+	if fn := f.onCapacity.Load(); forbidden && fn != nil {
+		(*fn)()
+	}
 	return nil
 }
 
@@ -2080,10 +1849,52 @@ func (f *eniIPFactory) Valid(resource zecTypes.NetResource) error {
 	}
 
 	if find != nil {
+		if find.err == nil && f.excludedLocked(eniIP.ENI.ID) {
+			return errENIExcluded
+		}
 		return find.err
 	}
 
 	return apiErr.ErrNotFound
+}
+
+// excludedENI reports an interface outside the configured pod subnets, from
+// which alone pod addresses come: the instance's primary when its subnet is not
+// one of them, or an interface created in a subnet since removed from them.
+func (f *eniIPFactory) excludedENI(eni *zecTypes.ENI) bool {
+	return eni != nil && f.eniFactory != nil && f.eniFactory.subnets != nil &&
+		!f.eniFactory.subnets.IsPodSubnet(eni.Subnet.ID)
+}
+
+// excludedLocked reports an interface marked forbidNotPodSubnet. What it holds
+// is Legacy: an idle address is given back by the pool's GC, one in use when
+// its pod releases it. Caller holds f's lock, not the ENI's.
+func (f *eniIPFactory) excludedLocked(eniID string) bool {
+	for _, eni := range f.enis {
+		if eni.ENI == nil || eni.ID != eniID {
+			continue
+		}
+		eni.Lock()
+		defer eni.Unlock()
+		return eni.forbidAssign&forbidNotPodSubnet != 0
+	}
+	return false
+}
+
+var _ pool.UsabilityChecker = (*eniIPFactory)(nil)
+
+// Usable is pool.UsabilityChecker: an address on an interface outside the pod
+// subnets is not handed out, from startup on -- its records join the pool
+// before the first GC can move them aside. Called under the pool lock; takes f's read lock and
+// the ENI's.
+func (f *eniIPFactory) Usable(resource zecTypes.NetResource) bool {
+	res, ok := resource.(*zecTypes.ENIIP)
+	if !ok || res.ENI == nil {
+		return true
+	}
+	f.RLock()
+	defer f.RUnlock()
+	return !f.excludedLocked(res.ENI.ID)
 }
 
 // List classifies every address this factory records as normal, legacy or
@@ -2132,6 +1943,7 @@ func (f *eniIPFactory) List() (map[zecTypes.ResStatus]map[string]zecTypes.NetRes
 			}{v4Map: map[string]net.IP{}, v6Net: nil}
 		}
 		eni.Lock()
+		excluded := eni.forbidAssign&forbidNotPodSubnet != 0
 		for _, eniipRes := range eni.ips {
 			valid := true
 			if eniipRes.IPSet.IPv4 != nil {
@@ -2150,6 +1962,8 @@ func (f *eniIPFactory) List() (map[zecTypes.ResStatus]map[string]zecTypes.NetRes
 			}
 			if !valid {
 				list[zecTypes.ResStatusInvalid][item.GetID()] = item
+			} else if eniipRes.err == nil && excluded {
+				list[zecTypes.ResStatusLegacy][item.GetID()] = item
 			} else if eniipRes.err == nil {
 				list[zecTypes.ResStatusNormal][item.GetID()] = item
 			} else if errors.Is(eniipRes.err, ErrLegacy) {
@@ -2247,10 +2061,19 @@ func (f *eniIPFactory) GetResourceLimit() int {
 	// A negative value is read badly by all three consumers: the device plugin
 	// advertises nothing, the pool's maxCap never grows, and judgmentEvictPod's
 	// "len(pods) >= limit" turns true for every pod and starts evicting.
-	if room := limit.AllocatableIPs() - nick; room > 0 {
-		return room
+	room := max(0, limit.AllocatableIPs()-nick)
+	// The "InstanceLimit Updated" line shows the quota-based figure only; say
+	// here when interfaces taking no new addresses (excluded, full) lower it.
+	if room != f.loggedLimit {
+		if nick > 0 {
+			log.Infof("Capacity %d: %d of the quota-based %d sit on interfaces that take no new pod addresses",
+				room, limit.AllocatableIPs()-room, limit.AllocatableIPs())
+		} else {
+			log.Infof("Capacity %d", room)
+		}
+		f.loggedLimit = room
 	}
-	return 0
+	return room
 }
 
 // GC reconciles the factory against the platform: interfaces the instance no
@@ -2324,6 +2147,18 @@ func (f *eniIPFactory) GC() error {
 	}
 
 	if len(ipMap) == 0 {
+		// Nothing is reconciled against an empty answer, but an interface
+		// outside the pod subnets that the platform and the local records
+		// both show empty can still be freed -- the pass below never runs
+		// once the last such address is gone.
+		for _, fEni := range slices.Clone(f.enis) {
+			if fEni.ENI == nil || eniMap[fEni.ID] == nil {
+				continue
+			}
+			fEni.Lock()
+			f.freeDrainedLocked(fEni)
+			fEni.Unlock()
+		}
 		return fmt.Errorf("pass gc due to the number of ip is 0")
 	}
 
@@ -2453,7 +2288,8 @@ func (f *eniIPFactory) GC() error {
 		// really did lose track of is the far more likely case, and stranding
 		// it costs capacity on every restart. The cost of being wrong is that
 		// an operator's address on the instance's own interface can end up
-		// serving a pod.
+		// serving a pod. Not on a primary outside the pod subnets, which
+		// serves no pod: there it is left alone (see the adopt switch below).
 		if o.ip.IPv4 != nil {
 			e.v4s = append(e.v4s, o.ip.IPv4)
 		}
@@ -2478,7 +2314,26 @@ func (f *eniIPFactory) GC() error {
 		}
 		fEni := f.appendEniLocked(temp)
 		fEni.Lock()
-		switch f.ipStack {
+		adopt := f.ipStack
+		if fEni.forbidAssign&forbidNotPodSubnet != 0 {
+			// On a secondary (this plugin's own): v4 alone, nothing carved;
+			// List files it Legacy and the pool gives it back. On the
+			// instance's primary nothing: it may be an operator's.
+			adopt = types.IPStackIPv4
+			if fEni.isPrimaryLocked() {
+				adopt = ""
+			}
+		}
+		if fEni == temp {
+			// Not on the pass that (re)built the interface, whatever its
+			// subnet: one that dropped out of a describe for a pass lost its
+			// records with it, and what its pods hold would be adopted under
+			// IDs their records do not match -- given back on an excluded
+			// interface, handed to a second pod on any other (dual-stack
+			// records are <v4>-<v6>, a fresh pairing is not).
+			adopt = ""
+		}
+		switch adopt {
 		case types.IPStackIPv4:
 			for _, v4 := range item.v4s {
 				fEni.appendIPLocked(&ENIIPRes{
@@ -2531,10 +2386,405 @@ func (f *eniIPFactory) GC() error {
 				}
 			}
 		}
+		if fEni != temp && f.freeDrainedLocked(fEni) {
+			fEni.Unlock()
+			continue
+		}
 		if fEni == temp {
 			go fEni.worker(f.eniIpReceiver)
 		}
 		fEni.Unlock()
+	}
+	return nil
+}
+
+// freeDrainedLocked frees an interface outside the pod subnets once it holds
+// no address: its pods are gone and the pool gave the rest back. Only
+// secondaries get here, and only ones this plugin created (GetAttachedENIs
+// manages no other secondary outside the pod subnets). Not on the GC pass that
+// built the interface, whose addresses have not been looked at yet. The free
+// runs in the background holding an eniPending slot, which keeps GC off until
+// it is done and keeps the API call off the GC path. Caller holds f.Lock and
+// e.Lock.
+func (f *eniIPFactory) freeDrainedLocked(e *ENI) bool {
+	if e.forbidAssign&forbidNotPodSubnet == 0 || e.isPrimaryLocked() || len(e.ips) > 0 || e.pending > 0 {
+		return false
+	}
+	select {
+	case f.eniPending <- struct{}{}:
+	default:
+		return false
+	}
+	e.forbidAssign |= forbidRetired
+	e.stopWorkerOnce()
+	f.deleteEniLocked(e)
+	log.Infof("ENI %s is outside the pod subnets and holds no pod address; freeing it", e.ID)
+	go func(eni *zecTypes.ENI) {
+		defer func() { <-f.eniPending }()
+		if err := f.eniFactory.Release(eni); err != nil {
+			log.Errorf("Free ENI %s outside the pod subnets: %v", eni.ID, err)
+		}
+	}(e.ENI)
+	return true
+}
+
+// livePodAddresses indexes this node's pods by the addresses the API server
+// says they hold, both ways round.
+//
+// The stored records are the primary source but not the only authority: if
+// the store is lost, every address on a managed ENI looks unclaimed and would
+// be pooled as free, live pods' included. Failing here is deliberate -- a
+// failed start is retried by the kubelet, a duplicated address is not
+// recoverable on its own.
+func livePodAddresses(k8s k8s.K8sService) (map[string]string, map[string]net.IP, error) {
+	livePodByIP := map[string]string{}
+	livePodV6 := map[string]net.IP{}
+	localPods, listErr := k8s.ListLocalPods(context.Background())
+	if listErr != nil {
+		return nil, nil, fmt.Errorf("list pods of this node to identify addresses already in use: %w", listErr)
+	}
+	for _, p := range localPods {
+		if p == nil || p.Spec.HostNetwork {
+			continue
+		}
+		// A pod that finished long enough ago is not holding anything: its
+		// sandbox is gone, its DEL has run, and Status.PodIPs is a record of
+		// what it had rather than a claim on it. Leaving it in would
+		// attribute the address to it again on this restart, and OwnerAlive
+		// would then keep it there for as long as the Pod object exists.
+		if finishedLongerThan(p, podTerminalGrace) {
+			log.Infof("Pod %s finished more than %v ago; not treating %v as still held by it",
+				zecTypes.PodKey(p.Namespace, p.Name), podTerminalGrace, p.Status.PodIPs)
+			continue
+		}
+		// PodIPs, not PodIP: on a dual-stack pod PodIP is only PodIPs[0],
+		// so indexing by it alone leaves the IPv6 half of every pod
+		// invisible here -- and with the record store lost, this index is
+		// what stops the rebuilt pool from handing a live pod's address to
+		// a second pod. PodIPs is empty on older objects, so fall back to
+		// PodIP.
+		ips := make([]string, 0, 2)
+		for _, ip := range p.Status.PodIPs {
+			if ip.IP != "" {
+				ips = append(ips, ip.IP)
+			}
+		}
+		if len(ips) == 0 && p.Status.PodIP != "" {
+			ips = append(ips, p.Status.PodIP)
+		}
+		for _, ip := range ips {
+			livePodByIP[ip] = zecTypes.PodKey(p.Namespace, p.Name)
+		}
+		// The same index the other way round. Recovering a pod needs the
+		// address that actually goes with the one found, and only the API
+		// server knows the pairing -- the platform publishes no per-address
+		// IPv6 view, so a locally carved counterpart is a guess.
+		for _, ip := range ips {
+			if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
+				livePodV6[zecTypes.PodKey(p.Namespace, p.Name)] = parsed
+			}
+		}
+	}
+	return livePodByIP, livePodV6, nil
+}
+
+// seedENIAddresses puts an interface's addresses into the pool at startup:
+// the stored records as in use, the rest as available or -- when a live pod
+// holds one with no record -- in use by that pod. v4s is every allocatable
+// IPv4 the platform reports on the interface; fEni.IPv6Net must already be
+// set for a stack with IPv6.
+func seedENIAddresses(p pool.ResourcePoolOp, fEni *ENI, v4s []net.IP, stack types.IPStack,
+	allocated map[string]zecTypes.NetResourceAllocated, livePodByIP map[string]string,
+	livePodV6 map[string]net.IP, maxCap int) error {
+	eni := fEni.ENI
+	var err error
+	v4sMap := pkgUtils.NetIPToMap(v4s)
+	for _, item := range allocated {
+		if item.Resource.GetResourceItem().ENIId != eni.ID {
+			continue
+		}
+		ipSet := zecTypes.IPSet{
+			IPv4: net.ParseIP(item.Resource.GetResourceItem().IPv4),
+			IPv6: net.ParseIP(item.Resource.GetResourceItem().IPv6),
+		}
+		// The IPv4 leaves the "unclaimed" set on the strength of the
+		// record, before any family is stripped -- the address is taken
+		// whatever stack this daemon now runs.
+		if ipSet.IPv4 != nil {
+			delete(v4sMap, ipSet.IPv4.String())
+		}
+
+		// Strip to the families in use first, then give the same object
+		// to both the pool and the factory. IPSet is a value and GetID()
+		// folds the addresses in, so registering an unstripped copy
+		// keys the two sides differently ("eni/<v4>-<v6>" vs
+		// "eni/<v4>"). Identical on a dual node; on a node switched back
+		// to ipv4 it makes pool.GC push a live pod's address into
+		// available. Switching the stack is supported.
+		if !stack.EnableIPv4() {
+			ipSet.IPv4 = nil
+		}
+		if !stack.EnableIPv6() {
+			ipSet.IPv6 = nil
+		}
+		// A record naming the interface's own primary is corrupt, and
+		// registering it is worse than losing it. It cannot be a pod's
+		// address -- the guest has it configured on the interface -- so
+		// the pod this record belongs to is not actually using it, and
+		// keeping the record only puts the address somewhere a later
+		// release can hand it to a pod that then black-holes.
+		//
+		// Dropped here rather than marked: a marked record still enters
+		// the pool, occupies a slot and inflates resource_pool_total
+		// until something reclaims it, and the reclaim path for a
+		// primary is a no-op by design. Nothing downstream wants it.
+		if namesInterfacePrimary(eni, ipSet) {
+			log.Warnf("Stored record for pod %s names eni %s's own primary address (%s); "+
+				"dropping it -- an address configured on the interface cannot also be a pod's",
+				item.Owner, eni.ID, ipSet.String())
+			continue
+		}
+		var resErr error
+		if (stack.EnableIPv4() && ipSet.IPv4 == nil) ||
+			(stack.EnableIPv6() && ipSet.IPv6 == nil) {
+			resErr = ErrLegacy
+		}
+		// An IPv6 outside this interface's prefix is not routed to it. The pod
+		// that has it keeps it; on release the pair is reclaimed, never pooled.
+		if ipSet.IPv6 != nil && fEni.IPv6Net != nil && !fEni.IPv6Net.Contains(ipSet.IPv6) {
+			log.Warnf("Stored record for pod %s pairs %s with %s, outside eni %s's prefix %s; "+
+				"it will be reclaimed on release", item.Owner, ipSet.IPv4, ipSet.IPv6, eni.ID, fEni.IPv6Net)
+			resErr = ErrLegacy
+		}
+		eniIP := &zecTypes.ENIIP{
+			ENI:   eni,
+			IPSet: ipSet,
+		}
+		p.AddInuse(eniIP, item.Owner)
+		fEni.appendIPLocked(&ENIIPRes{
+			ENIIP: eniIP,
+			err:   resErr,
+		})
+	}
+
+	if stack.EnableIPv4() && !stack.EnableIPv6() {
+		// What remains in v4sMap are addresses the platform reports on a
+		// managed ENI that no stored pod claims. Adopting them is what
+		// lets an address survive a restart -- the platform still counts
+		// it against the per-NIC quota, so leaving it shrinks the node's
+		// capacity on every restart.
+		//
+		// This includes the instance's own interface (its primary is
+		// already excluded by GetENIAllocatableIPs), so an address an
+		// operator attached by hand is adoptable too -- the accepted
+		// cost of having no per-address ownership tag. Not when that
+		// interface is outside the pod subnets: then only what a live pod
+		// holds is taken.
+		fEni.Lock()
+		skipUnowned := fEni.forbidAssign&forbidNotPodSubnet != 0 && fEni.isPrimaryLocked()
+		fEni.Unlock()
+		for _, ipv4 := range v4sMap {
+			if _, live := livePodByIP[ipv4.String()]; skipUnowned && !live {
+				continue // an excluded primary's: may be an operator's
+			}
+			eniIP := &ENIIPRes{
+				ENIIP: &zecTypes.ENIIP{
+					ENI: eni,
+					IPSet: zecTypes.IPSet{
+						IPv4: ipv4,
+					},
+				},
+			}
+			fEni.appendIPLocked(eniIP)
+			// A pod on this node is holding this address even though no
+			// stored record mentions it -- the record was lost. Take the
+			// API server's word for it and mark the address in use, or
+			// the next pod scheduled here would be given an address that
+			// is already carrying traffic.
+			if owner, held := livePodByIP[ipv4.String()]; held {
+				log.Warnf("Address %s on eni %s is held by pod %s but has no stored record; recovering it as in-use",
+					ipv4, eni.ID, owner)
+				p.AddInuse(eniIP.ENIIP, owner)
+				continue
+			}
+			p.AddAvailable(eniIP.ENIIP) // no need to deal with ipv6
+		}
+	} else if !stack.EnableIPv4() && stack.EnableIPv6() {
+		fEni.Lock()
+		v6List, err := fEni.AllocateIPv6AddressLocked(maxCap)
+		fEni.Unlock()
+		if err != nil {
+			return fmt.Errorf("allocate IPv6 address from ipv6 cidr %v of eni %s  failed, %v", fEni.IPv6Net.String(), fEni.ID, err)
+		}
+		for _, ipv6 := range v6List {
+			eniIP := &ENIIPRes{
+				ENIIP: &zecTypes.ENIIP{
+					ENI: eni,
+					IPSet: zecTypes.IPSet{
+						IPv6: ipv6,
+					},
+				},
+			}
+			fEni.appendIPLocked(eniIP)
+			p.AddAvailable(eniIP.ENIIP) // no need to deal with ipv4
+		}
+	} else {
+		var v4List []net.IP
+		for _, v4 := range v4sMap {
+			v4List = append(v4List, v4)
+		}
+		// Nothing to pair is the common case, not an error: v4sMap holds
+		// only the addresses the platform reports that no stored record
+		// claims, and on a freshly started node with an intact record
+		// store -- or on a primary interface carrying nothing but the
+		// node's own address, which GetENIAllocatableIPs filters out --
+		// that set is empty. AllocateIPv6AddressLocked rejects a count
+		// of zero, so calling it unconditionally failed PreStart, and a
+		// failed PreStart takes the whole daemon down. Every dual node
+		// would have CrashLooped on its first start.
+		if len(v4List) == 0 {
+			return nil
+		}
+		// Pair from what the API server says, not from carve order.
+		// Zipping freshly carved addresses against v4List pairs them at
+		// random (v4List comes from ranging a map), and on this path --
+		// a lost record store with pods still running -- the carve can
+		// reproduce an address a live pod already holds. livePodV6 knows
+		// the real pairing: use it, reserve the live addresses first, and
+		// carve only for what no live pod claims.
+		fEni.Lock()
+		// Only the ones e.ips does not already carry. A live pod whose
+		// stored record survived was appended above, which spent any
+		// reservation for it -- reserving it again here would leave an
+		// entry nothing can ever spend, which takes the address out of
+		// the prefix for the life of the interface.
+		held := make(map[string]struct{}, len(fEni.ips))
+		for _, rec := range fEni.ips {
+			if rec.IPSet.IPv6 != nil {
+				held[rec.IPSet.IPv6.String()] = struct{}{}
+			}
+		}
+		var liveV6 []net.IP
+		for _, v6 := range livePodV6 {
+			if fEni.IPv6Net == nil || !fEni.IPv6Net.Contains(v6) {
+				continue
+			}
+			if _, ok := held[v6.String()]; ok {
+				continue
+			}
+			liveV6 = append(liveV6, v6)
+		}
+		fEni.reserveV6Locked(liveV6)
+		fEni.Unlock()
+
+		type recovered struct {
+			v4    net.IP
+			v6    net.IP
+			owner string
+			// legacy: on an excluded interface, held by no live pod. Taken
+			// as a v4-only Legacy entry for the pool to give back; nothing
+			// is carved for it.
+			legacy bool
+		}
+		items := make([]recovered, 0, len(v4List))
+		carveFor := 0
+		fEni.Lock()
+		excluded := fEni.forbidAssign&forbidNotPodSubnet != 0
+		excludedPrimary := excluded && fEni.isPrimaryLocked()
+		fEni.Unlock()
+		for _, v4 := range v4List {
+			it := recovered{v4: v4}
+			if excluded {
+				// The interface serves no new pod and may have no prefix: carve
+				// nothing. What a live pod holds is recovered for it; on a
+				// secondary (this plugin's own) the rest is Legacy, given back by
+				// the pool; on the instance's primary it is left alone.
+				if owner, ok := livePodByIP[v4.String()]; ok {
+					it.owner = owner
+					if v6 := livePodV6[owner]; v6 != nil && fEni.IPv6Net != nil && fEni.IPv6Net.Contains(v6) {
+						it.v6 = v6
+					}
+				} else if excludedPrimary {
+					continue // may be an operator's
+				} else {
+					it.legacy = true
+				}
+				items = append(items, it)
+				continue
+			}
+			if owner, ok := livePodByIP[v4.String()]; ok {
+				it.owner = owner
+				if v6 := livePodV6[owner]; v6 != nil && fEni.IPv6Net != nil && fEni.IPv6Net.Contains(v6) {
+					it.v6 = v6
+				}
+			}
+			if it.v6 == nil && it.owner == "" {
+				carveFor++
+			}
+			items = append(items, it)
+		}
+
+		var carved []net.IP
+		if carveFor > 0 {
+			fEni.Lock()
+			carved, err = fEni.AllocateIPv6AddressLocked(carveFor)
+			fEni.Unlock()
+			if err != nil {
+				return fmt.Errorf("allocate IPv6 address from ipv6 cidr %v of eni %s failed, %v", fEni.IPv6Net.String(), fEni.ID, err)
+			}
+		}
+
+		next := 0
+		for _, it := range items {
+			if it.v6 == nil && it.owner == "" && !it.legacy {
+				it.v6 = carved[next]
+				next++
+			}
+			eniIP := &ENIIPRes{
+				ENIIP: &zecTypes.ENIIP{
+					ENI:   eni,
+					IPSet: zecTypes.IPSet{IPv4: it.v4, IPv6: it.v6},
+				},
+			}
+			// An incomplete set is marked, exactly as the stored-record
+			// arm above marks one. Without it Valid() returns nil, so
+			// pool.Release skips ReleaseInValid and pushes the half set
+			// onto the available queue -- and factory.List classifies it
+			// Normal, because it checks a family only when that family
+			// is present, so every later reconcile re-queues it too.
+			// Either way the next pod on a dual node comes up with no
+			// IPv6 and nothing ever repairs the entry.
+			if it.v6 == nil {
+				eniIP.err = ErrLegacy
+			}
+			if it.owner == "" {
+				fEni.appendIPLocked(eniIP)
+				p.AddAvailable(eniIP.ENIIP)
+				continue
+			}
+			// A live pod claims this address. Recover it as in-use so
+			// the next pod scheduled here is not given an address that
+			// is already carrying traffic.
+			if it.v6 == nil {
+				// The pod holds this IPv4 but no IPv6 out of this
+				// interface's prefix. Record what is true rather than
+				// inventing a counterpart: an invented one would be
+				// configured on no interface, and releasing the resource
+				// instead would unassign the address the pod is using.
+				// Being in use does not keep it out of the available
+				// queue: pool.GC moves an in-use entry there once its
+				// record is gone and its owner is not alive. The
+				// ErrLegacy stamped above does -- Valid returns it and
+				// List files the entry under Legacy.
+				log.Warnf("Pod %s holds address %s on eni %s with no ipv6 from this interface's prefix; recovering the ipv4 alone",
+					it.owner, it.v4, eni.ID)
+			} else {
+				log.Warnf("Address set %s on eni %s is held by pod %s but has no stored record; recovering it as in-use",
+					eniIP.IPSet.String(), eni.ID, it.owner)
+			}
+			fEni.appendIPLocked(eniIP)
+			p.AddInuse(eniIP.ENIIP, it.owner)
+		}
 	}
 	return nil
 }

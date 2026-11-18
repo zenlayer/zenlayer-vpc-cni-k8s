@@ -47,6 +47,10 @@ ENGINE ?= docker
 IMAGE_NAME ?= docker.io/zenlayer1/zeccni
 IMAGE_TAG ?= $(VERSION)
 IMAGE_NAME_TAG ?= $(IMAGE_NAME):$(IMAGE_TAG)
+# The controlplane's own image (images/controlplane.Dockerfile): the node
+# image's name with -controlplane, released with the same tag.
+CONTROLPLANE_IMAGE_NAME ?= $(IMAGE_NAME)-controlplane
+CONTROLPLANE_IMAGE_NAME_TAG ?= $(CONTROLPLANE_IMAGE_NAME):$(IMAGE_TAG)
 # Chart version and appVersion default to whatever Chart.yaml declares, so a
 # packaged chart stays self-consistent with the image tag in values.yaml.
 # Override both when cutting a release.
@@ -68,7 +72,9 @@ CHANGELOG_VERSION ?= $(shell sed -n 's/^\#\# \[\([0-9][^]]*\)\].*/\1/p' CHANGELO
 GOPROXY ?=
 DEBUG ?= 1
 FLAG=-gcflags="all=-trimpath=$(PWD)"
-LD_FLAGS=-ldflags="-s -w"
+# Linker flags go into the single -ldflags of CNI_VERSION_LD_FLAG: go build
+# keeps only the last -ldflags it is given, so a separate one is dropped.
+LD_FLAGS=-s -w
 ifeq ($(DEBUG), 1)
 	FLAG=-gcflags="all=-N -l"
 	LD_FLAGS=
@@ -76,7 +82,7 @@ endif
 # CNIVersion carries the git describe output alone. The branch goes in its own
 # variable rather than being appended as "<version>@<branch>": see the comment
 # on version.CNIVersion for why.
-CNI_VERSION_LD_FLAG=-ldflags="-X '$(MODULE_NAME)/pkg/version.CNIVersion=$(VERSION)' -X '$(MODULE_NAME)/pkg/version.GitCommitID=$(COMMIT_ID)' -X '$(MODULE_NAME)/pkg/version.GitBranch=$(BRANCH)' -X '$(MODULE_NAME)/pkg/version.BuildTime=$(DATE_NOW)'"
+CNI_VERSION_LD_FLAG=-ldflags="$(LD_FLAGS) -X '$(MODULE_NAME)/pkg/version.CNIVersion=$(VERSION)' -X '$(MODULE_NAME)/pkg/version.GitCommitID=$(COMMIT_ID)' -X '$(MODULE_NAME)/pkg/version.GitBranch=$(BRANCH)' -X '$(MODULE_NAME)/pkg/version.BuildTime=$(DATE_NOW)'"
 # Only pass what is actually set: an empty --build-arg X= still lands as ENV X=""
 # in the image. HTTP_PROXY used to be missing here entirely, and GOPROXY was
 # passed twice.
@@ -127,7 +133,7 @@ help:
 	@make -qp | sed -nr 's/^([a-zA-Z][a-zA-Z0-9_-]*):([^=]|$$)/\1/p' | grep -v '^Makefile$$' | sort -u | tr '\n' ' ' && echo
 	@echo "\033[m└─────────────────────────────────────────────────"
 
-.PHONY: tidy .container-engine .helm .check-arch zec-cni zec-ipam bin pkg image chart chart-lint chart-template version-check license license-check all clean
+.PHONY: tidy .container-engine .helm .check-arch zec-cni zec-ipam zec-controlplane bin pkg image image-controlplane chart chart-lint chart-template version-check license license-check all clean
 
 tidy:
 	go mod tidy
@@ -140,14 +146,18 @@ tidy:
 
 
 zec-cni:
-	CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -o $(OUTPUT)/zec-cni $(FLAG) $(LD_FLAGS) $(CNI_VERSION_LD_FLAG) \
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -o $(OUTPUT)/zec-cni $(FLAG) $(CNI_VERSION_LD_FLAG) \
 		./cmd/zenlayer-vpc-cni
 
 zec-ipam:
-	CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -o $(OUTPUT)/zec-ipam $(FLAG) $(LD_FLAGS) $(CNI_VERSION_LD_FLAG) \
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -o $(OUTPUT)/zec-ipam $(FLAG) $(CNI_VERSION_LD_FLAG) \
 		./cmd/cni-ipam
 
-bin: tidy zec-cni zec-ipam
+zec-controlplane:
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -o $(OUTPUT)/zec-controlplane $(FLAG) $(CNI_VERSION_LD_FLAG) \
+		./cmd/zec-controlplane
+
+bin: tidy zec-cni zec-ipam zec-controlplane
 
 pkg: bin
 	cp ./script/bootstrap/* $(OUTPUT)/
@@ -159,6 +169,13 @@ image: .container-engine .check-arch
 		--build-arg VERSION=$(VERSION) --build-arg COMMIT_ID=$(COMMIT_ID) --build-arg BRANCH=$(BRANCH) \
 		${BUILD_ARGS} .
 	@echo "Built OCI image \"$(IMAGE_NAME)\""
+
+image-controlplane: .container-engine .check-arch
+	$(ENGINE) build -t ${CONTROLPLANE_IMAGE_NAME_TAG} -f ./images/controlplane.Dockerfile \
+		--build-arg BUILD_IMAGE=$(BUILD_IMAGE) \
+		--build-arg VERSION=$(VERSION) --build-arg COMMIT_ID=$(COMMIT_ID) --build-arg BRANCH=$(BRANCH) \
+		${BUILD_ARGS} .
+	@echo "Built OCI image \"$(CONTROLPLANE_IMAGE_NAME)\""
 
 # version-check fails the build when the four places a version appears drift
 # apart: the CHANGELOG heading, Chart.yaml's appVersion, Chart.yaml's own
@@ -226,14 +243,27 @@ else
 	@echo "license-check: ok"
 endif
 
+# The behavior switches the chart requires; see the top of chart/values.yaml.
+CHART_SWITCHES := --set zec.ipStack=ipv4 --set zec.manageUntaggedENI=false \
+	--set cni.mode=chained --set cilium.enabled=false --set networkPolicy.enabled=false
+CHART_IDS := --set zec.vpcID=vpc-test --set 'zec.subnetIDs={subnet-test}' --set zec.securityGroupID=sg-test
+# Both IPAM modes, as CI renders them: crd adds the controlplane, which needs a
+# region and the admission API it is gated on.
+CHART_DIRECT := --set zec.ipamType=direct
+CHART_CRD := --set zec.ipamType=crd --set controlplane.deployment.enabled=true \
+	--set controlplane.regionID=region-test \
+	--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy
+
+# helm lint has no --api-versions, so the crd path (gated on the admission
+# API) is checked by chart-template only.
 chart-lint: .helm
-	$(HELM) lint $(CHART_DIR) --set zec.vpcID=vpc-test --set 'zec.subnetIDs={subnet-test}' --set zec.securityGroupID=sg-test
+	$(HELM) lint $(CHART_DIR) $(CHART_IDS) $(CHART_SWITCHES) $(CHART_DIRECT)
 
 # Render with the required values filled in, so the `required`/`fail` guards in
 # the templates do not mask real template errors.
 chart-template: .helm
-	@$(HELM) template zenlayer-vpc-cni $(CHART_DIR) \
-		--set zec.vpcID=vpc-test --set 'zec.subnetIDs={subnet-test}' --set zec.securityGroupID=sg-test
+	@$(HELM) template zenlayer-vpc-cni $(CHART_DIR) $(CHART_IDS) $(CHART_SWITCHES) $(CHART_DIRECT)
+	@$(HELM) template zenlayer-vpc-cni $(CHART_DIR) $(CHART_IDS) $(CHART_SWITCHES) $(CHART_CRD)
 
 # Package the chart, stamping it with the same version the image gets.
 chart: chart-lint
@@ -242,9 +272,9 @@ chart: chart-lint
 		--version $(CHART_VERSION) --app-version $(CHART_APP_VERSION)
 	@echo "Packaged chart into $(CHART_OUTPUT)"
 
-all: pkg image chart
+all: pkg image image-controlplane chart
 
 clean:
 	go clean -r -x
 	rm -rf ./$(OUTPUT)
-	docker rmi ${IMAGE_NAME_TAG}
+	docker rmi ${IMAGE_NAME_TAG} ${CONTROLPLANE_IMAGE_NAME_TAG}

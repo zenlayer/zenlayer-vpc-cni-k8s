@@ -1,0 +1,129 @@
+# One node's address state when zec.ipamType is crd. The node's daemon writes
+# spec (how many IPv4 addresses it wants, which it no longer needs, and its own
+# account of which instance it is); the controlplane, which alone holds the
+# OpenAPI credentials, writes status. Installed whatever ipamType is: an unused
+# CRD costs nothing, and helm never upgrades or removes CRDs anyway.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: zecnodes.network.zenlayer.com
+spec:
+  group: network.zenlayer.com
+  scope: Cluster
+  names:
+    kind: ZecNode
+    listKind: ZecNodeList
+    plural: zecnodes
+    singular: zecnode
+    shortNames: [ "zn" ]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Instance
+          type: string
+          jsonPath: .status.node.instanceID
+        - name: Requested
+          type: integer
+          jsonPath: .spec.ipv4.requested
+        - name: Allocatable
+          type: integer
+          jsonPath: .status.capacity.allocatable
+        - name: Ready
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Ready")].status
+        - name: Reason
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Ready")].reason
+        - name: Allocation
+          type: string
+          jsonPath: .status.conditions[?(@.type=="IPAllocationFailed")].reason
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                identity:
+                  type: object
+                  properties:
+                    instanceID: { type: string }
+                    primaryMAC: { type: string }
+                    primaryIP: { type: string }
+                ipv4:
+                  type: object
+                  properties:
+                    requested:
+                      type: integer
+                      minimum: 0
+                    releasing:
+                      type: array
+                      items: { type: string }
+            status:
+              type: object
+              properties:
+                observedGeneration: { type: integer, format: int64 }
+                ipStack: { type: string }
+                node:
+                  type: object
+                  properties:
+                    instanceID: { type: string }
+                    zoneID: { type: string }
+                capacity:
+                  type: object
+                  properties:
+                    eniQuota: { type: integer }
+                    ipv4PerENI: { type: integer }
+                    eniUnmanaged: { type: integer }
+                    allocatable: { type: integer, minimum: 0 }
+                scaler:
+                  type: object
+                  properties:
+                    targetMin: { type: integer }
+                    target: { type: integer }
+                enis:
+                  type: array
+                  items:
+                    type: object
+                    required: [ "id", "mac" ]
+                    properties:
+                      id: { type: string }
+                      mac: { type: string }
+                      primary: { type: boolean }
+                      subnetID: { type: string }
+                      state: { type: string }
+                      primaryIPv4: { type: string }
+                      ipv4:
+                        type: array
+                        items:
+                          type: object
+                          required: [ "ip" ]
+                          properties:
+                            ip: { type: string }
+                            state: { type: string }
+                            owner: { type: string }
+                      ipv6:
+                        type: object
+                        required: [ "prefix" ]
+                        properties:
+                          prefix: { type: string }
+                          primary: { type: string }
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [ "type", "status", "lastTransitionTime", "reason", "message" ]
+                    properties:
+                      type: { type: string }
+                      status: { type: string }
+                      observedGeneration: { type: integer, format: int64 }
+                      lastTransitionTime: { type: string, format: date-time }
+                      reason: { type: string }
+                      message: { type: string }

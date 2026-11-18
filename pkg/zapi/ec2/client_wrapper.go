@@ -71,37 +71,62 @@ type ZecClient struct {
 // production endpoint). The SDK exposes Domain as a plain field rather than a
 // With* option, so it is assigned directly.
 func NewZecClient(secretKeyId, secretKeyPassword, domain string) (*ZecClient, error) {
-	var (
-		err       error
-		zecClient *zecApi.Client
-	)
-	// AutoRetry off: retries live in this repo's ExponentialBackoff wrappers,
-	// which read the error code and stop once a rejection is final. The SDK
-	// retries blindly and, with RetryDuration at zero, without pausing. Its
-	// rate-limit layer stays on -- that one reads HTTP 429 semantics this side
-	// cannot see.
-	//
-	// The timeout is well under a CNI ADD's budget, since an attempt outliving
-	// daemonRPCTimeout cannot help the pod waiting on it -- but not tighter,
-	// because abandoning a write is worse than waiting for one: the platform has
-	// applied an assign whose response never arrived, leaving an address nothing
-	// here knows it owns.
+	zecClient, err := zecApi.NewClient(newConfig(domain), secretKeyId, secretKeyPassword)
+	if err != nil || zecClient == nil {
+		log.Errorf("Create zenlayer api client failed, %v", err)
+		return nil, err
+	}
+	return &ZecClient{zecClient: zecClient, isLocal: true}, nil
+}
+
+// NewZecClientWithStsCredential builds the OpenAPI client with a temporary
+// credential issued by AssumeRole; the SDK sends its security token and signs
+// it. A renewed credential needs a new client.
+func NewZecClientWithStsCredential(credential *zecCom.StsCredential, domain string) (*ZecClient, error) {
+	zecClient := &zecApi.Client{}
+	if err := zecClient.InitWithStsCredential(credential); err != nil {
+		log.Errorf("Create zenlayer api client failed, %v", err)
+		return nil, err
+	}
+	if err := zecClient.WithConfig(newConfig(domain)); err != nil {
+		log.Errorf("Create zenlayer api client failed, %v", err)
+		return nil, err
+	}
+	return &ZecClient{zecClient: zecClient, isLocal: true}, nil
+}
+
+// newConfig is the SDK configuration every client here shares.
+//
+// AutoRetry off: retries live in this repo's ExponentialBackoff wrappers,
+// which read the error code and stop once a rejection is final. The SDK
+// retries blindly and, with RetryDuration at zero, without pausing. Its
+// rate-limit layer stays on -- that one reads HTTP 429 semantics this side
+// cannot see.
+//
+// The timeout is well under a CNI ADD's budget, since an attempt outliving
+// daemonRPCTimeout cannot help the pod waiting on it -- but not tighter,
+// because abandoning a write is worse than waiting for one: the platform has
+// applied an assign whose response never arrived, leaving an address nothing
+// here knows it owns.
+func newConfig(domain string) *zecCom.Config {
 	config := zecCom.NewConfig().WithTimeout(apiAttemptTimeoutSec).WithAutoRetry(false)
 	config.Debug = zecCom.Bool(sdkHTTPDumpEnabled())
 	if domain != "" {
 		config.Domain = domain
 		log.Infof("Zenlayer OpenAPI domain overridden to %s", domain)
 	}
-	zecClient, err = zecApi.NewClient(config, secretKeyId, secretKeyPassword)
-	if err != nil || zecClient == nil {
-		log.Errorf("Create zenlayer api client failed, %v", err)
-		return nil, err
-	}
-	cm := &ZecClient{
-		zecClient: zecClient,
-		isLocal:   true,
-	}
-	return cm, nil
+	return config
+}
+
+// DescribeInstancesByIPv4 lists instances by an IPv4 address. The platform's
+// filter is a prefix match that also hits secondary and public addresses and
+// ignores the VPC, so the caller must filter the answer exactly; the list is
+// paged at 20 by default and pageNum is 1-based.
+func (c *ZecClient) DescribeInstancesByIPv4(ip string, pageNum int) (*zecApi.DescribeInstancesResponse, error) {
+	req := zecApi.NewDescribeInstancesRequest()
+	req.Ipv4Address = &ip
+	req.PageNum = &pageNum
+	return c.zecClient.DescribeInstances(req)
 }
 
 func (c *ZecClient) DescribeInstances(instanceIds []string) (*zecApi.DescribeInstancesResponse, error) {

@@ -7,6 +7,7 @@ import (
 	"net"
 	"testing"
 
+	"github.com/zenlayer/zenlayer-vpc-cni-k8s/pkg/daemon/types"
 	zecTypes "github.com/zenlayer/zenlayer-vpc-cni-k8s/types"
 )
 
@@ -120,4 +121,49 @@ func TestValidRefusesTheInterfacesOwnPrimary(t *testing.T) {
 			t.Errorf("Valid = %v for an ordinary in-use address, want nil", err)
 		}
 	})
+}
+
+type seedPool struct{ inuse []zecTypes.NetResource }
+
+func (p *seedPool) AddInuse(r zecTypes.NetResource, _ string) { p.inuse = append(p.inuse, r) }
+func (p *seedPool) AddInvalid(zecTypes.NetResource)           {}
+func (p *seedPool) AddAvailable(zecTypes.NetResource)         {}
+
+// TestSeedFlagsIPv6OutsidePrefix: a stored pair whose IPv6 is not in the
+// interface's prefix stays with its pod but is marked, so Valid refuses it on
+// release and it never reaches another pod.
+func TestSeedFlagsIPv6OutsidePrefix(t *testing.T) {
+	vpcENI := primaryENI()
+	_, v6Net, _ := net.ParseCIDR("2001:2:0:7775:0:1::/96")
+	vpcENI.IPv6Net = v6Net
+	e := &ENI{ENI: vpcENI}
+	rec := func(v4, v6 string) zecTypes.NetResourceAllocated {
+		return zecTypes.NetResourceAllocated{Owner: "ns/" + v4, Resource: &zecTypes.ENIIP{
+			ENI: vpcENI, IPSet: zecTypes.IPSet{IPv4: net.ParseIP(v4), IPv6: net.ParseIP(v6)}}}
+	}
+	allocated := map[string]zecTypes.NetResourceAllocated{
+		"in":  rec("10.0.0.44", "2001:2:0:7775:0:1:0:9"),
+		"out": rec("10.0.0.45", "2001:2:0:7775:0:5:0:30"),
+	}
+	p := &seedPool{}
+	if err := seedENIAddresses(p, e, nil, types.IPStackDual, allocated, nil, nil, 28); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.inuse) != 2 {
+		t.Fatalf("seeded %d in-use, want 2: the pod holding the bad pair keeps it", len(p.inuse))
+	}
+	f := &eniIPFactory{enis: []*ENI{e}}
+	for _, r := range e.ips {
+		err := f.Valid(r.ENIIP)
+		switch r.IPSet.IPv4.String() {
+		case "10.0.0.44":
+			if err != nil {
+				t.Errorf("Valid = %v for a pair inside the prefix", err)
+			}
+		case "10.0.0.45":
+			if err == nil {
+				t.Errorf("Valid = nil for an IPv6 outside the prefix; release would pool it")
+			}
+		}
+	}
 }

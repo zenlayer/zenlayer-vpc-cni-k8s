@@ -5,6 +5,7 @@ package factory
 
 import (
 	"testing"
+	"time"
 
 	zecCom "github.com/zenlayer/zenlayercloud-sdk-go/zenlayercloud/common"
 	zecApi "github.com/zenlayer/zenlayercloud-sdk-go/zenlayercloud/zec20250901"
@@ -59,8 +60,8 @@ func TestIsOwnENIRestsOnTagsNotName(t *testing.T) {
 	const self = "1755670178034880550"
 	const other = "1755516676029419624"
 
-	ownTags := utils.CniENITags(self)
-	foreignTags := utils.CniENITags(other)
+	ownTags := utils.CniENITags(self, "")
+	foreignTags := utils.CniENITags(other, "")
 
 	for _, tc := range []struct {
 		name string
@@ -116,12 +117,50 @@ func TestIsOwnENIRestsOnTagsNotName(t *testing.T) {
 // it can exempt an interface this daemon itself created, and it holds whichever
 // way manageUntaggedENI is set -- an operator who tags a storage or management
 // interface gets one answer they can rely on without also knowing the config.
+// Clusters may share a VPC, and the controlplane sweeps the whole VPC: it may
+// delete only what this cluster created, plus interfaces with no cluster id
+// (made before the tag, or by a cluster on an older version, which sweeps them
+// the same way). Another cluster's interface is that cluster's to sweep.
+func TestSweepableKeepsToThisCluster(t *testing.T) {
+	const self, other = "uid-self", "uid-other"
+	withCluster := func(id string) map[string]string { return utils.CniENITags("i-1", id) }
+	for _, tc := range []struct {
+		name      string
+		clusterID string
+		tags      map[string]string
+		want      bool
+	}{
+		{"this cluster's", self, withCluster(self), true},
+		{"no cluster tag", self, withCluster(""), true},
+		{"another cluster's", self, withCluster(other), false},
+		{"not created by the plugin", self, map[string]string{utils.TagKeyClusterID: self}, false},
+		{"own id unknown: untagged still swept", "", withCluster(""), true},
+		{"own id unknown: any tagged one left alone", "", withCluster(other), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &ZecAPIImpl{clusterID: tc.clusterID}
+			if got := e.sweepable(nicWith("eni", tc.tags)); got != tc.want {
+				t.Fatalf("sweepable = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// The sweep threshold must outlast a create still waiting for its interface
+// to attach (attachENI's retry budget, about 5.5 minutes), or a create in
+// progress -- this cluster's or another's -- is deleted under it.
+func TestLeakThresholdOutlastsAttach(t *testing.T) {
+	if eniLeakedTime < 6*time.Minute {
+		t.Fatalf("eniLeakedTime %s is shorter than the attach budget", eniLeakedTime)
+	}
+}
+
 func TestIsManagedENIPrecedence(t *testing.T) {
 	const self = "1755670178034880550"
 	const other = "1755516676029419624"
 
-	own := utils.CniENITags(self)
-	foreign := utils.CniENITags(other)
+	own := utils.CniENITags(self, "")
+	foreign := utils.CniENITags(other, "")
 	noManage := map[string]string{utils.TagKeyNoManage: "true"}
 
 	ownAndNoManage := map[string]string{}
@@ -235,8 +274,8 @@ func TestIsManagedENIAdoptsOnlyConfiguredSubnets(t *testing.T) {
 
 		// Ownership outranks the subnet: a subnet removed from the config later
 		// must not strand an interface this daemon created.
-		{"our own, configured subnet", "subnet-pods", utils.CniENITags(self), true},
-		{"our own, subnet since removed from config", "subnet-gone", utils.CniENITags(self), true},
+		{"our own, configured subnet", "subnet-pods", utils.CniENITags(self, ""), true},
+		{"our own, subnet since removed from config", "subnet-gone", utils.CniENITags(self, ""), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := &ZecAPIImpl{

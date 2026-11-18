@@ -53,7 +53,10 @@ const (
 	ENIStatusAvailable = "AVAILABLE"
 	ENIStatusInuse     = "USED"
 
-	eniLeakedTime = 5 * time.Minute
+	// eniLeakedTime is how long an interface sits detached before a sweep
+	// deletes it. Above the longest create -> attach -> in-use wait (about 5.5
+	// minutes of retry budget), so a create still waiting is never swept.
+	eniLeakedTime = 10 * time.Minute
 	maxPageSize   = 100
 )
 
@@ -149,6 +152,8 @@ type ZecAPIImpl struct {
 	primaryENIID string
 
 	tags map[string]string
+	// clusterID is this cluster's id (k8s.ClusterID); empty when unknown.
+	clusterID string
 }
 
 // PrimaryENIID returns the id of the instance's own network interface.
@@ -263,7 +268,7 @@ func (e *ZecAPIImpl) freeENI(eniID string, sleepDelayAfterDetach time.Duration) 
 		log.Errorf("FreeENI: detach network interface failed: %s", err.Error())
 		fmtErr := fmt.Sprintf("detach eni failed, %v", err)
 		_ = tracing.RecordNodeEvent(v1.EventTypeWarning, tracing.EventReleaseResourceFailed, fmtErr)
-		return fmt.Errorf("free ENI failed while detach: %s", err.Error())
+		return fmt.Errorf("free ENI failed while detach: %w", err)
 	}
 
 	time.Sleep(sleepDelayAfterDetach)
@@ -279,10 +284,10 @@ func (e *ZecAPIImpl) freeENI(eniID string, sleepDelayAfterDetach time.Duration) 
 
 // createENI creates an unattached ENI and pre-assigns the addresses it should
 // carry: ipv4Cnt-1 secondary IPv4s on top of the one the create returns, and an
-// IPv6 prefix when enableIpv6. A failure after the create rolls it back.
-func (e *ZecAPIImpl) createENI(subnetId string, securityGroupId string, ipv4Cnt int, enableIpv6 bool) (string, error) {
+// IPv6 prefix when enableIpv6. A failure after the create rolls it back; a
+// rollback that fails too adds ErrENILeftBehind to the returned error.
+func (e *ZecAPIImpl) createENI(subnetId string, securityGroupId string, ipv4Cnt int, enableIpv6 bool) (_ string, err error) {
 	var eniResponse *zecApi.CreateNetworkInterfaceResponse
-	var err error
 
 	nicName := utils.GetCniNicName(e.GetInstanceId())
 
@@ -298,11 +303,20 @@ func (e *ZecAPIImpl) createENI(subnetId string, securityGroupId string, ipv4Cnt 
 		// The instance's vNIC quota is the same argument: nothing frees a slot
 		// while the backoff runs, and the wait is spent holding blockPause,
 		// which also stops GC. LimitExceeded.EnisPerInstance and
-		// QuotaExceeded.Eni are two spellings of the same refusal.
+		// QuotaExceeded.Eni are two spellings of the same refusal. An exhausted
+		// subnet is the same again: nothing frees an address while we wait.
 		if err == nil || errCodes.WithPublicErrCodes().WithErrCodes(apiErr.OperationFailedResourceGroupNotFound, apiErr.InvalidSubnetNotFound,
 			apiErr.InvalidSecurityGroupNotFound, apiErr.OperationDeniedInternetChargeTypeNotSupport,
-			apiErr.LimitExceededEnisPerInstance, apiErr.QuotaExceededEni).
+			apiErr.LimitExceededEnisPerInstance, apiErr.QuotaExceededEni,
+			apiErr.INVALID_SUBNET_IPV4_INSUFFICIENT, apiErr.OPERATION_DENIED_SUBNET_IP_INSUFFICIENT,
+			apiErr.InsufficientIpInSubnet).
 			ErrChainEqual(err) {
+			return true, err
+		}
+		// The create is not idempotent: one whose answer was lost may have
+		// made an interface, and a retry would make another. The tagged
+		// leak sweep removes it if it exists.
+		if OutcomeUnknown(err) {
 			return true, err
 		}
 		return false, nil
@@ -328,9 +342,9 @@ func (e *ZecAPIImpl) createENI(subnetId string, securityGroupId string, ipv4Cnt 
 	eniID := *(eniResponse.Response.NicId)
 	defer func() {
 		if err != nil {
-			err = e.deleteENI(eniID)
-			if err != nil {
-				log.Errorf("rollback create eni due to %v", err)
+			if derr := e.deleteENI(eniID); derr != nil {
+				log.Errorf("rollback create eni %s due to %v", eniID, derr)
+				err = fmt.Errorf("%w (deleting %s also failed: %v): %w", ErrENILeftBehind, eniID, derr, err)
 			}
 		}
 	}()
@@ -413,39 +427,12 @@ func (e *ZecAPIImpl) AllocENI(subnetId string, securityGroupId string, ipCnt int
 	})
 	lg.Infof("Creating eni")
 
-	ipv4Cnt := 0
-	if e.IPStack.EnableIPv4() {
-		ipv4Cnt = ipCnt
-	}
-
-	eniId, err := e.createENI(subnetId, securityGroupId, ipv4Cnt, e.IPStack.EnableIPv6())
+	eniInfo, err := e.CreateAndAttachENI(subnetId, securityGroupId, ipCnt)
 	if err != nil {
-		fmtErr := fmt.Sprintf("AllocENI failed, %v", err)
-		_ = tracing.RecordNodeEvent(v1.EventTypeWarning, tracing.EventAllocateResourceFailed, fmtErr)
-		// %w: last hop before eniFactory.CreateWithIPCount, which reads the
-		// platform's error code off it to decide whether the cached vNIC quota
-		// is stale. A %v here undoes the %w in createENI and attachENI.
-		return nil, fmt.Errorf("AllocENI: failed to create ENI: %w", err)
+		return nil, err
 	}
-
+	eniId := zecCom.ToString(eniInfo.NicId)
 	lg = lg.WithFields(zlog.Fields{"EniId": eniId})
-	eniInfo, err := e.attachENI(eniId)
-	if err != nil {
-		// An attach error does not mean the interface stayed off the instance.
-		// attachENI also reports failure when the write landed but the status
-		// poll ran out of budget, and when a retry gets INVALID_NIC_ATTACHED
-		// because an earlier attempt took effect and its response was lost. A
-		// delete cannot remove an attached interface, so cleaning up that way
-		// left the interface this call had just created on the instance for
-		// good. FreeENI detaches first and treats an already-detached interface
-		// as detached, so it covers the attached and the never-attached case
-		// alike.
-		lg.Errorf("Attach eni failed, freeing it, %v", err)
-		if freeErr := e.FreeENI(eniId); freeErr != nil {
-			lg.Errorf("Failed to free newly created ENI %s: %v", eniId, freeErr)
-		}
-		return nil, fmt.Errorf("alloc ENI: error attaching ENI: %w", err)
-	}
 
 	defer func() {
 		if err != nil {
@@ -468,7 +455,7 @@ func (e *ZecAPIImpl) AllocENI(subnetId string, securityGroupId string, ipCnt int
 		return true, nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("get eni from metadata failed, %v, %v", inErr, err)
+		return nil, fmt.Errorf("get eni from metadata failed, %w, %v", inErr, err)
 	}
 	if e.IPStack.EnableIPv4() && zecCom.ToString(eniInfo.PrimaryIpv4) != "" {
 		eni.PrimaryIP.IPv4 = net.ParseIP(zecCom.ToString(eniInfo.PrimaryIpv4))
@@ -489,6 +476,67 @@ func (e *ZecAPIImpl) AllocENI(subnetId string, securityGroupId string, ipCnt int
 	}
 	return eni, nil
 }
+
+// CreateAndAttachENI is the platform half of AllocENI: create an interface with
+// ipCnt IPv4 addresses (and an IPv6 /96 when the stack has IPv6), attach it to
+// this instance, and free it again if the attach fails. It never reads the
+// metadata service, so the controlplane can call it for a node it is not on.
+func (e *ZecAPIImpl) CreateAndAttachENI(subnetId, securityGroupId string, ipCnt int) (*zecApi.NicInfo, error) {
+	ipv4Cnt := 0
+	if e.IPStack.EnableIPv4() {
+		ipv4Cnt = ipCnt
+	}
+
+	eniId, err := e.createENI(subnetId, securityGroupId, ipv4Cnt, e.IPStack.EnableIPv6())
+	if err != nil {
+		fmtErr := fmt.Sprintf("AllocENI failed, %v", err)
+		_ = tracing.RecordNodeEvent(v1.EventTypeWarning, tracing.EventAllocateResourceFailed, fmtErr)
+		// %w: last hop before eniFactory.CreateWithIPCount, which reads the
+		// platform's error code off it to decide whether the cached vNIC quota
+		// is stale. A %v here undoes the %w in createENI and attachENI.
+		return nil, fmt.Errorf("AllocENI: failed to create ENI: %w", err)
+	}
+
+	lg := log.WithFields(zlog.Fields{"EniId": eniId, "InstanceId": e.GetInstanceId()})
+	eniInfo, err := e.attachENI(eniId)
+	if err != nil {
+		// An attach error does not mean the interface stayed off the instance.
+		// attachENI also reports failure when the write landed but the status
+		// poll ran out of budget, and when a retry gets INVALID_NIC_ATTACHED
+		// because an earlier attempt took effect and its response was lost. A
+		// delete cannot remove an attached interface, so cleaning up that way
+		// left the interface this call had just created on the instance for
+		// good. FreeENI detaches first and treats an already-detached interface
+		// as detached, so it covers the attached and the never-attached case
+		// alike.
+		lg.Errorf("Attach eni failed, freeing it, %v", err)
+		// Sent after the cleanup so the event says whether the interface is
+		// gone or left behind on the instance -- ahead of the platform error,
+		// which can be long enough for the event message to be cut short.
+		outcome := "the ENI was freed"
+		freeErr := e.FreeENI(eniId)
+		if freeErr != nil {
+			lg.Errorf("Failed to free newly created ENI %s: %v", eniId, freeErr)
+			outcome = fmt.Sprintf("freeing it also failed: %v", freeErr)
+		}
+		_ = tracing.RecordNodeEvent(v1.EventTypeWarning, tracing.EventAttachENIFailed,
+			fmt.Sprintf("Attach ENI %s failed (%s): %v", eniId, outcome, err))
+		if freeErr != nil {
+			return nil, fmt.Errorf("alloc ENI: %w, %w (%s): %w", ErrAttachENI, ErrENILeftBehind, outcome, err)
+		}
+		return nil, fmt.Errorf("alloc ENI: %w (%s): %w", ErrAttachENI, outcome, err)
+	}
+	return eniInfo, nil
+}
+
+// ErrAttachENI marks an interface that was created but could not be attached
+// to the instance. Callers tell it from a refused create with errors.Is; the
+// platform's error stays reachable with errors.As alongside it.
+var ErrAttachENI = errors.New("error attaching ENI")
+
+// ErrENILeftBehind marks a failed create that could not undo itself: the
+// interface, and the addresses it took, are still on the platform.
+var ErrENILeftBehind = errors.New("ENI left behind")
 
 func (e *ZecAPIImpl) FreeENI(eniID string) error {
 	return e.freeENI(eniID, 2*time.Second)
@@ -574,7 +622,7 @@ func (e *ZecAPIImpl) isManagedENI(nic *zecApi.NicInfo) bool {
 func (e *ZecAPIImpl) GetAttachedENIs() (result []*zecTypes.ENI, err error) {
 	enis, err := e.getNetworkInterfacesByDescribe(ENIStatusInuse, "", nil, false)
 	if err != nil {
-		return nil, fmt.Errorf("filter eni failed, %v", err)
+		return nil, fmt.Errorf("filter eni failed, %w", err)
 	}
 
 	var cniMacs, adoptedMacs, primaryMacs, skippedMacs []string
@@ -654,7 +702,7 @@ func (e *ZecAPIImpl) GetTotalAttachedEniCnt() (int, error) {
 		return true, nil
 	})
 	if err = apiErr.BackoffErrWrapper(err, inErr); err != nil {
-		return 0, fmt.Errorf("describe instance failed, %v, %v", err, inErr)
+		return 0, fmt.Errorf("describe instance failed, %w, %v", err, inErr)
 	}
 	if resp == nil || resp.Response == nil || len(resp.Response.DataSet) == 0 {
 		return 0, fmt.Errorf("describe instance failed, no result")
@@ -669,7 +717,7 @@ func (e *ZecAPIImpl) GetSecondaryENIMACs() ([]string, error) {
 	var result []string
 	enis, err := e.getNetworkInterfacesByDescribe(ENIStatusInuse, ENITypeSecondary, nil, true)
 	if err != nil {
-		return nil, fmt.Errorf("filter secondary eni failed, %v", err)
+		return nil, fmt.Errorf("filter secondary eni failed, %w", err)
 	}
 	for _, eni := range enis {
 		result = append(result, zecCom.ToString(eni.MacAddress))
@@ -824,64 +872,15 @@ func (e *ZecAPIImpl) AllocIPv4Addresses(eniID, eniMac string, v4Cnt int) ([]net.
 	}()
 
 	if e.IPStack.EnableIPv4() && v4Cnt > 0 {
-		var assignIPResp *zecApi.BatchAssignNetworkInterfaceIpv4Response
-		werr := wait.ExponentialBackoff(backoff.BackOff(backoff.APIWriteOps), func() (bool, error) {
-			assignIPResp, err = e.ec2Client.AssignPrivateIpAddress(eniID, []string{}, v4Cnt)
-			if err == nil {
-				return true, nil
-			}
-			errCodes := &apiErr.OpenApiErrCodeChain{}
-			if errCodes.WithPublicErrCodes().WithErrCodes(apiErr.OPERATION_DENIED_SUBNET_TYPE_NOT_SUPPORT_IPV4,
-				apiErr.INVALID_NIC_PRIVATE_IP_EXCEED_LIMIT, apiErr.INVALID_SUBNET_PRIVATE_IPV4_IN_USED,
-				apiErr.INVALID_IP_BROADCAST_ADDRESS, apiErr.INVALID_SUBNET_PRIVATE_IPV4_IN_USED,
-				apiErr.INVALID_IP_OUT_OF_RANGE, apiErr.INVALID_IP_FIRST_ADDRESS,
-				apiErr.OPERATION_FAILED_RESOURCE_NOT_FOUND, apiErr.INVALID_IP_NETWORK_ADDRESS,
-				// Retrying an exhausted subnet cannot succeed within one call:
-				// nothing frees addresses while the backoff runs. Measured at
-				// 62-70s burned per attempt before giving up, and before this
-				// code was listed the attempts were repeated against the same
-				// ENI, because the caller never learned it was full.
-				apiErr.OPERATION_DENIED_SUBNET_IP_INSUFFICIENT, apiErr.InsufficientIpInSubnet,
-				// A full interface is the same argument as an exhausted subnet:
-				// nothing frees an address on this interface while the backoff
-				// runs, and the wait is spent holding blockPause, which also
-				// stops GC. This is the code the platform actually returns;
-				// INVALID_NIC_PRIVATE_IP_EXCEED_LIMIT above is the other spelling,
-				// and the forbidAssign check in worker() lists both.
-				apiErr.OPERATION_DENIED_NIC_ATTACH_LAN_IP_EXCEED_LIMIT,
-				apiErr.INVALID_NIC_STATUS).ErrChainEqual(err) {
-				return false, err
-			}
-			// No error code means the platform never answered, so the request
-			// may have been applied. This assign is not idempotent -- an empty
-			// ip list means "give me v4Cnt more" -- so retrying would ask for
-			// another v4Cnt on top, up to six times. The caller reconciles an
-			// ambiguous assign with recoverAfterAmbiguousAssign.
-			if apiErr.ErrCode(err) == "" {
-				return false, err
-			}
-			return false, nil
-		})
-		if err = apiErr.BackoffErrWrapper(werr, err); err != nil {
-			// %w, not %s: two readers match on the platform's error code via
-			// errors.As -- worker()'s forbidAssign check, and receiveRes(),
-			// which refreshes the instance limit and wakes GC. Rendering the
-			// error into the message leaves the code visible to
-			// strings.Contains but unreachable to errors.As, so both go quiet
-			// at once. Pinned by
-			// TestAllocIPv4AddressesReturnsAnUnwrappableError.
-			return ipv4s, fmt.Errorf("failed to assign private ips on ENI %s, err: %w", eniID, err)
+		var aErr error
+		ipv4s, aErr = e.assignIPv4Locked(eniID, v4Cnt)
+		if errors.Is(aErr, errShortAssign) {
+			// Returned without the rollback, as before the platform half was
+			// split out: nothing was parsed, so there is nothing to roll back.
+			return ipv4s, aErr
 		}
-
-		if assignIPResp != nil && assignIPResp.Response != nil {
-			ipl := len(assignIPResp.Response.IpAddresses)
-			if ipl < v4Cnt {
-				return ipv4s, fmt.Errorf("the total number of ips is %d, less than wanted: %d", ipl, v4Cnt)
-			}
-			ipv4s, err = pkgUtils.ParseIPs(assignIPResp.Response.IpAddresses[ipl-v4Cnt:])
-			if err != nil {
-				return ipv4s, err
-			}
+		if err = aErr; err != nil {
+			return ipv4s, err
 		}
 
 		// MetaStatusWait, not APIStatusWait: this waits on the node's own
@@ -913,6 +912,88 @@ func (e *ZecAPIImpl) AllocIPv4Addresses(eniID, eniMac string, v4Cnt int) ([]net.
 	return ipv4s, nil
 }
 
+// errShortAssign: the platform assigned fewer addresses than asked for.
+var errShortAssign = errors.New("short assign")
+
+// assignIPv4Locked asks the platform for v4Cnt more IPv4 addresses on an
+// interface and returns them. It is the platform half of AllocIPv4Addresses
+// and never reads the metadata service. The caller must hold privateIPMutex.
+func (e *ZecAPIImpl) assignIPv4Locked(eniID string, v4Cnt int) ([]net.IP, error) {
+	var err error
+	var assignIPResp *zecApi.BatchAssignNetworkInterfaceIpv4Response
+	werr := wait.ExponentialBackoff(backoff.BackOff(backoff.APIWriteOps), func() (bool, error) {
+		assignIPResp, err = e.ec2Client.AssignPrivateIpAddress(eniID, []string{}, v4Cnt)
+		if err == nil {
+			return true, nil
+		}
+		errCodes := &apiErr.OpenApiErrCodeChain{}
+		if errCodes.WithPublicErrCodes().WithErrCodes(apiErr.OPERATION_DENIED_SUBNET_TYPE_NOT_SUPPORT_IPV4,
+			apiErr.INVALID_NIC_PRIVATE_IP_EXCEED_LIMIT, apiErr.INVALID_SUBNET_PRIVATE_IPV4_IN_USED,
+			apiErr.INVALID_IP_BROADCAST_ADDRESS, apiErr.INVALID_SUBNET_PRIVATE_IPV4_IN_USED,
+			apiErr.INVALID_IP_OUT_OF_RANGE, apiErr.INVALID_IP_FIRST_ADDRESS,
+			apiErr.OPERATION_FAILED_RESOURCE_NOT_FOUND, apiErr.INVALID_IP_NETWORK_ADDRESS,
+			// Retrying an exhausted subnet cannot succeed within one call:
+			// nothing frees addresses while the backoff runs. Measured at
+			// 62-70s burned per attempt before giving up, and before this
+			// code was listed the attempts were repeated against the same
+			// ENI, because the caller never learned it was full.
+			apiErr.OPERATION_DENIED_SUBNET_IP_INSUFFICIENT, apiErr.InsufficientIpInSubnet,
+			apiErr.INVALID_SUBNET_IPV4_INSUFFICIENT,
+			// A full interface is the same argument as an exhausted subnet:
+			// nothing frees an address on this interface while the backoff
+			// runs, and the wait is spent holding blockPause, which also
+			// stops GC. This is the code the platform actually returns;
+			// INVALID_NIC_PRIVATE_IP_EXCEED_LIMIT above is the other spelling,
+			// and the forbidAssign check in worker() lists both.
+			apiErr.OPERATION_DENIED_NIC_ATTACH_LAN_IP_EXCEED_LIMIT,
+			apiErr.INVALID_NIC_STATUS).ErrChainEqual(err) {
+			return false, err
+		}
+		// No answer from the platform -- no code, or the SDK's own code for a
+		// transport failure, timeouts included -- means the request may have
+		// been applied. This assign is not idempotent -- an empty ip list
+		// means "give me v4Cnt more" -- so retrying would ask for another
+		// v4Cnt on top, up to six times. The caller reconciles an ambiguous
+		// assign with recoverAfterAmbiguousAssign.
+		if OutcomeUnknown(err) {
+			return false, err
+		}
+		return false, nil
+	})
+	if err = apiErr.BackoffErrWrapper(werr, err); err != nil {
+		// %w, not %s: two readers match on the platform's error code via
+		// errors.As -- worker()'s forbidAssign check, and receiveRes(),
+		// which refreshes the instance limit and wakes GC. Rendering the
+		// error into the message leaves the code visible to
+		// strings.Contains but unreachable to errors.As, so both go quiet
+		// at once. Pinned by
+		// TestAllocIPv4AddressesReturnsAnUnwrappableError.
+		return nil, fmt.Errorf("failed to assign private ips on ENI %s, err: %w", eniID, err)
+	}
+
+	if assignIPResp != nil && assignIPResp.Response != nil {
+		ipl := len(assignIPResp.Response.IpAddresses)
+		if ipl < v4Cnt {
+			return nil, fmt.Errorf("%w: the total number of ips is %d, less than wanted: %d", errShortAssign, ipl, v4Cnt)
+		}
+		return pkgUtils.ParseIPs(assignIPResp.Response.IpAddresses[ipl-v4Cnt:])
+	}
+	return nil, nil
+}
+
+// AssignIPv4 is assignIPv4Locked for a caller that is not on the node, the
+// controlplane: no metadata wait and no rollback. An assign whose outcome is
+// unknown needs no recovery there, because the controlplane rebuilds its view
+// from describe on every pass and adopts whatever the platform reports.
+func (e *ZecAPIImpl) AssignIPv4(eniID string, v4Cnt int) ([]net.IP, error) {
+	if eniID == "" || v4Cnt <= 0 {
+		return nil, fmt.Errorf("AssignIPv4 needs an interface id and a positive count, got %q and %d", eniID, v4Cnt)
+	}
+	e.privateIPMutex.Lock()
+	defer e.privateIPMutex.Unlock()
+	return e.assignIPv4Locked(eniID, v4Cnt)
+}
+
 func (e *ZecAPIImpl) DeallocIPv4Addresses(eniID, eniMac string, ipv4s []net.IP) error {
 	e.privateIPMutex.Lock()
 	defer e.privateIPMutex.Unlock()
@@ -936,7 +1017,6 @@ func (e *ZecAPIImpl) deallocIPv4AddressesWithLocked(eniID, eniMac string, ipv4s 
 		return nil
 	}
 
-	var errs []error
 	lg := log.WithFields(zlog.Fields{
 		"ENI":   eniID,
 		"IPv4s": pkgUtils.ToStringSlice(ipv4s),
@@ -952,6 +1032,38 @@ func (e *ZecAPIImpl) deallocIPv4AddressesWithLocked(eniID, eniMac string, ipv4s 
 		}
 	}()
 
+	if err = e.unassignIPv4Locked(eniID, ipv4s); err != nil {
+		return err
+	}
+
+	var inErr error
+	werr := wait.ExponentialBackoff(backoff.BackOff(backoff.MetaStatusWait), func() (bool, error) {
+		var metaV4s []net.IP
+		metaV4s, inErr = e.metadataSvc.GetENIPrivateIPv4s(context.Background(), eniMac)
+		if inErr != nil {
+			return false, nil
+		}
+		if len(ipv4s) > 0 && pkgUtils.NetIPContainAny(metaV4s, ipv4s) {
+			inErr = fmt.Errorf("ips %s were expected to be unassigned, but the interface still reports %s", ipv4s, metaV4s)
+			return false, nil
+		}
+		return true, nil
+	})
+
+	if werr != nil {
+		return inErr
+	}
+	return nil
+}
+
+// unassignIPv4Locked is the platform half of deallocIPv4AddressesWithLocked:
+// one unassign call for every address, retried, never reading the metadata
+// service. An address or interface the platform no longer has counts as done.
+// The caller must hold privateIPMutex.
+func (e *ZecAPIImpl) unassignIPv4Locked(eniID string, ipv4s []net.IP) error {
+	lg := log.WithFields(zlog.Fields{"ENI": eniID, "IPv4s": pkgUtils.ToStringSlice(ipv4s)})
+	var err error
+	var errs []error
 	// One unassign call covers every address, so this either fully succeeds or
 	// fully fails. There is no partially-released state for the caller to
 	// distinguish, which is why no "halfway" sentinel is produced here.
@@ -980,28 +1092,23 @@ func (e *ZecAPIImpl) deallocIPv4AddressesWithLocked(eniID, eniMac string, ipv4s 
 		}
 	}
 
-	if len(errs) > 0 {
-		return k8sErr.NewAggregate(errs)
-	}
+	// errors.Join, not an aggregate: callers read the platform's error code
+	// through errors.As, which an aggregate does not unwrap.
+	return errors.Join(errs...)
+}
 
-	var inErr error
-	werr := wait.ExponentialBackoff(backoff.BackOff(backoff.MetaStatusWait), func() (bool, error) {
-		var metaV4s []net.IP
-		metaV4s, inErr = e.metadataSvc.GetENIPrivateIPv4s(context.Background(), eniMac)
-		if inErr != nil {
-			return false, nil
-		}
-		if len(ipv4s) > 0 && pkgUtils.NetIPContainAny(metaV4s, ipv4s) {
-			inErr = fmt.Errorf("ips %s were expected to be unassigned, but the interface still reports %s", ipv4s, metaV4s)
-			return false, nil
-		}
-		return true, nil
-	})
-
-	if werr != nil {
-		return inErr
+// UnassignIPv4 is unassignIPv4Locked for the controlplane, which is not on
+// the node and so has no metadata to wait on.
+func (e *ZecAPIImpl) UnassignIPv4(eniID string, ipv4s []net.IP) error {
+	if eniID == "" {
+		return fmt.Errorf("UnassignIPv4 needs an interface id")
 	}
-	return nil
+	if len(ipv4s) == 0 {
+		return nil
+	}
+	e.privateIPMutex.Lock()
+	defer e.privateIPMutex.Unlock()
+	return e.unassignIPv4Locked(eniID, ipv4s)
 }
 
 func (e *ZecAPIImpl) GetOrAssignIPv6Block(eniID, eniMac string) (ipv6Net *net.IPNet, primaryV6 net.IP, err error) {
@@ -1356,7 +1463,7 @@ func (e *ZecAPIImpl) GetENI(eniId, subnetId, mac string) (*zecTypes.ENI, error) 
 }
 
 func New(apiClient ec2.EC2, ipStack types.IPStack, subnetMgr SubnetManager, instanceMetadata InstanceMetadataGetter,
-	ipv6Billing ec2.IPv6Billing, manageUntaggedENI bool) (*ZecAPIImpl, error) {
+	ipv6Billing ec2.IPv6Billing, manageUntaggedENI bool, clusterID string) (*ZecAPIImpl, error) {
 
 	impl := &ZecAPIImpl{
 		IPStack:                ipStack,
@@ -1369,11 +1476,154 @@ func New(apiClient ec2.EC2, ipStack types.IPStack, subnetMgr SubnetManager, inst
 		limits:                 NewLimitProvider(),
 		// Stamped on every ENI this daemon creates and used to recognize them
 		// again -- see utils.CniENITags.
-		tags: utils.CniENITags(instanceMetadata.GetInstanceId()),
+		tags:      utils.CniENITags(instanceMetadata.GetInstanceId(), clusterID),
+		clusterID: clusterID,
 	}
 
 	go wait.Forever(impl.cleanUpLeakedENIs, time.Hour)
 
 	log.Infof("zenlayer api impl created")
 	return impl, nil
+}
+
+// NewForInstance returns the platform operations for one instance, for a
+// caller that is not on that instance: the controlplane. It has no metadata
+// service, so only the methods that never read it may be called --
+// CreateAndAttachENI, AssignIPv4, UnassignIPv4, GetOrAssignIPv6Block, FreeENI,
+// DescribeAttachedNICs, GetInstanceLimit, CleanUpLeakedENIsInVPC. It starts
+// no background work; the caller schedules the leak sweep.
+func NewForInstance(apiClient ec2.EC2, ipStack types.IPStack, subnetMgr SubnetManager,
+	instance InstanceMetadataGetter, ipv6Billing ec2.IPv6Billing, manageUntaggedENI bool, clusterID string) *ZecAPIImpl {
+	return &ZecAPIImpl{
+		IPStack:                ipStack,
+		ipv6Billing:            ipv6Billing,
+		manageUntaggedENI:      manageUntaggedENI,
+		ec2Client:              apiClient,
+		InstanceMetadataGetter: instance,
+		subnetMgr:              subnetMgr,
+		limits:                 NewLimitProvider(),
+		tags:                   utils.CniENITags(instance.GetInstanceId(), clusterID),
+		clusterID:              clusterID,
+	}
+}
+
+// DescribeAttachedNICs returns every interface attached to the instance, the
+// primary and the unmanaged ones included, as the platform describes them.
+func (e *ZecAPIImpl) DescribeAttachedNICs() ([]*zecApi.NicInfo, error) {
+	return e.getNetworkInterfacesByDescribe(ENIStatusInuse, "", nil, false)
+}
+
+// IsManagedENI reports whether this plugin may put pod addresses on nic; see
+// isManagedENI.
+func (e *ZecAPIImpl) IsManagedENI(nic *zecApi.NicInfo) bool { return e.isManagedENI(nic) }
+
+// IsOwnENI reports whether this plugin created nic for this instance.
+func (e *ZecAPIImpl) IsOwnENI(nic *zecApi.NicInfo) bool { return e.isOwnENI(nic) }
+
+// CleanUpLeakedENIsInVPC deletes the interfaces this plugin created, for any
+// instance of this cluster, that sit detached in vpcID untouched for
+// eniLeakedTime: what a deleted instance leaves when its interfaces are not
+// deleted with it, and what a create whose attach and undo both failed
+// leaves. It is the controlplane's sweep; DeleteNetworkInterface refuses an
+// attached interface, so one attached meanwhile is safe. See sweepable for
+// whose interfaces count.
+func (e *ZecAPIImpl) CleanUpLeakedENIsInVPC(vpcID string) {
+	nics, err := e.getNetworkInterfacesByDescribe(ENIStatusAvailable, ENITypeSecondary, nil, false)
+	if err != nil {
+		log.Errorf("List detached interfaces in region %s: %v", e.GetRegionId(), err)
+		return
+	}
+	for _, nic := range nics {
+		id := zecCom.ToString(nic.NicId)
+		if zecCom.ToString(nic.VpcId) != vpcID || !e.sweepable(nic) {
+			continue
+		}
+		updated, err := time.Parse(time.RFC3339, zecCom.ToString(nic.UpdateTime))
+		if err != nil || time.Since(updated) <= eniLeakedTime {
+			continue
+		}
+		if err := e.deleteENI(id); err != nil {
+			log.Warnf("Failed to clean up leaked interface %s: %v", id, err)
+			continue
+		}
+		log.Infof("Cleaned up leaked interface %s (detached since %s)", id, updated.Format(time.RFC3339))
+	}
+}
+
+// sweepable reports an interface the VPC-wide sweep may delete: created by this
+// plugin, and either tagged with this cluster's id or with no cluster id at
+// all. The latter are interfaces made before the tag existed, or by a cluster
+// on an older version, which sweeps them the same way; one tagged with another
+// cluster's id is that cluster's to sweep. With this cluster's id unknown only
+// untagged ones qualify.
+func (e *ZecAPIImpl) sweepable(nic *zecApi.NicInfo) bool {
+	if !createdByPlugin(nic) {
+		return false
+	}
+	owner := tagValue(nic, utils.TagKeyClusterID)
+	return owner == "" || (e.clusterID != "" && owner == e.clusterID)
+}
+
+func tagValue(nic *zecApi.NicInfo, key string) string {
+	if nic == nil || nic.Tags == nil {
+		return ""
+	}
+	for _, t := range nic.Tags.Tags {
+		if zecCom.ToString(t.Key) == key {
+			return zecCom.ToString(t.Value)
+		}
+	}
+	return ""
+}
+
+// createdByPlugin reports the created-by tag alone, whichever instance the
+// interface was made for.
+func createdByPlugin(nic *zecApi.NicInfo) bool {
+	if nic == nil || nic.Tags == nil {
+		return false
+	}
+	for _, t := range nic.Tags.Tags {
+		if zecCom.ToString(t.Key) == utils.TagKeyCreatedBy && zecCom.ToString(t.Value) == utils.TagValueCreatedBy {
+			return true
+		}
+	}
+	return false
+}
+
+// NewMetadataOnly returns a ZecAPIImpl that can only read the node's metadata
+// service: GetENI and the Metadata* methods. It holds no OpenAPI client, for
+// the daemon in ipamType crd, which has no credentials.
+func NewMetadataOnly(ipStack types.IPStack) *ZecAPIImpl {
+	return &ZecAPIImpl{
+		IPStack:     ipStack,
+		metadataSvc: metadata.NewEC2MetadataWrapper(metadata.New()),
+	}
+}
+
+// MetadataMACs lists the MACs of the interfaces the metadata service reports.
+func (e *ZecAPIImpl) MetadataMACs() ([]string, error) {
+	return e.metadataSvc.GetENIsMACs(context.Background())
+}
+
+// MetadataPrimaryIPv4 is an interface's own IPv4 according to the metadata service.
+func (e *ZecAPIImpl) MetadataPrimaryIPv4(mac string) (net.IP, error) {
+	return e.metadataSvc.GetENIPrimaryIP(context.Background(), mac)
+}
+
+// MetadataPrimaryIPv6 is an interface's own IPv6 according to the metadata service.
+func (e *ZecAPIImpl) MetadataPrimaryIPv6(mac string) (net.IP, error) {
+	return e.metadataSvc.GetENIPrimaryIPv6(context.Background(), mac)
+}
+
+// OutcomeUnknown reports an error that does not say whether the call took
+// effect: no code at all, the code the SDK gives a transport failure (a
+// timeout, a broken body, a gateway's non-JSON error page), or the platform's
+// own timeout and server-error codes.
+func OutcomeUnknown(err error) bool {
+	switch apiErr.ErrCode(err) {
+	case "", zecCom.NetworkError, zecCom.IoError, zecCom.JsonParseError,
+		apiErr.RequestTimedOut, apiErr.InternalServerError, apiErr.ServiceTemporaryUnavailable:
+		return true
+	}
+	return false
 }

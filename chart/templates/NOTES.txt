@@ -1,16 +1,27 @@
 {{ .Chart.Name }} {{ .Chart.Version }} has been installed as release "{{ .Release.Name }}".
 
 The DaemonSet runs one zec-ipam pod per linux/amd64 node in the kube-system
-namespace. Each pod manages the ENIs of its own node and serves the zec-cni
+namespace. Each pod keeps its node's address pool and serves the zec-cni
 plugin over a unix socket.
+{{- if eq .Values.zec.ipamType "crd" }}
+
+IPAM TYPE: crd
+  Only the controlplane calls the Zenlayer OpenAPI; the nodes hold no
+  credentials. Each node's address state is in its ZecNode:
+
+    kubectl get zn
+{{- else }}
+
+IPAM TYPE: direct
+  Every node's daemon calls the Zenlayer OpenAPI with the mounted credentials,
+  so every node needs internet egress. See docs/deploy-direct.md.
+{{- end }}
 
 CNI MODE: {{ .Values.cni.mode }}
 {{- if eq .Values.cni.mode "delegated" }}
   Cilium is the plugin kubelet executes and it creates the pod device. This
   plugin supplies the address and installs the per-ENI ip rules and route
   table, and creates no device of its own.
-
-NETWORK POLICY:  {{ if .Values.networkPolicy.enabled }}{{ .Values.networkPolicy.provider }}{{ else }}not enforced{{ end }}
 
   Service traffic is handled by Cilium's eBPF, which this mode requires
   (kubeProxyReplacement=true). kube-proxy is expected to be removed once the
@@ -32,13 +43,16 @@ NETWORK POLICY:  {{ if .Values.networkPolicy.enabled }}{{ .Values.networkPolicy.
   is not chained here: with kubeProxyReplacement on, cilium serves hostPort from
   its own BPF load balancer, and a hostPort inside the NodePort range (30000-32767)
   is refused outright -- keep such ports below 30000.
+
+NETWORK POLICY:  {{ if .Values.networkPolicy.enabled }}{{ .Values.networkPolicy.provider }}{{ else if .Values.cilium.enabled }}not declared (the Cilium agent still enforces NetworkPolicy){{ else }}not enforced{{ end }}
 {{- else }}
 DATAPATH: {{ .Values.zec.dataPath }}
   Pods are attached with a veth pair and per-ENI policy routing. Service
-  traffic reaches the host stack directly and is handled by kube-proxy.
+  traffic reaches the host stack directly and is handled by {{ if .Values.cilium.enabled }}Cilium's eBPF
+  load balancer, or kube-proxy where Cilium does not replace it{{ else }}kube-proxy{{ end }}.
 
 CILIUM CHAINING: {{ if .Values.cilium.enabled }}enabled{{ else }}disabled{{ end }}
-NETWORK POLICY:  {{ if .Values.networkPolicy.enabled }}{{ .Values.networkPolicy.provider }}{{ else }}not enforced{{ end }}
+NETWORK POLICY:  {{ if .Values.networkPolicy.enabled }}{{ .Values.networkPolicy.provider }}{{ else if .Values.cilium.enabled }}not declared (the Cilium agent still enforces NetworkPolicy){{ else }}not enforced{{ end }}
 {{- if .Values.cilium.enabled }}
 
   The conflist hands each pod to cilium-cni after this plugin has wired it.
@@ -67,21 +81,22 @@ NETWORK POLICY:  {{ if .Values.networkPolicy.enabled }}{{ .Values.networkPolicy.
       cat /host-etc-net.d/10-zenlayer-cni.conflist
 {{- end }}
 {{- end }}
-{{- if not .Values.networkPolicy.enabled }}
+{{- if not (or .Values.networkPolicy.enabled .Values.cilium.enabled) }}
 
   NetworkPolicy objects are not enforced. Nothing rejects them, so a policy that
   should block traffic simply does not: the cluster looks configured and is not.
-  Set networkPolicy.enabled=true (with cilium.enabled=true) to change that.
+  Set cilium.enabled=true and deploy Cilium to enforce it; networkPolicy.enabled=true
+  additionally makes this chart require that.
 {{- end }}
 
-{{- if not (lookup "v1" "Secret" "kube-system" .Values.zec.secretName) }}
+{{- if and (or (ne .Values.zec.ipamType "crd") ((.Values.controlplane).deployment).enabled) (not (lookup "v1" "Secret" "kube-system" .Values.zec.secretName)) }}
 
   ############################################################################
   Secret "{{ .Values.zec.secretName }}" was not found in kube-system.
   (This check is skipped by `helm template`, which cannot query the cluster --
   the message always shows there.)
 
-  The daemon reads its Zenlayer OpenAPI credentials from that Secret and will
+  {{ if eq .Values.zec.ipamType "crd" }}The controlplane{{ else }}The daemon{{ end }} reads its Zenlayer OpenAPI credentials from that Secret and will
   not start without it. The chart deliberately does not template the
   credentials, so they never end up in values.yaml or the release. Create it:
 
@@ -89,9 +104,16 @@ NETWORK POLICY:  {{ if .Values.networkPolicy.enabled }}{{ .Values.networkPolicy.
       --from-literal=AccessKeyID='<access-key-id>' \
       --from-literal=AccessKeyPassword='<access-key-secret>'
 
+{{- if eq .Values.zec.ipamType "crd" }}
+
+  Until then the controlplane pod waits in ContainerCreating (a FailedMount
+  event); kubelet retries the mount and starts it within a few minutes.
+{{- else }}
+
   Then restart the DaemonSet:
 
     kubectl -n kube-system rollout restart daemonset/zenlayer-vpc-cni
+{{- end }}
   ############################################################################
 {{- end }}
 
@@ -109,10 +131,18 @@ of the node (the pods run with hostNetwork):
 Logs are written to /var/log/zenlayer/ on each node. Set the level with this
 chart's zec.logLevel value, which renders it onto the daemonset for you:
 
-  helm upgrade {{ .Release.Name }} <chart> --reuse-values --set zec.logLevel=debug
+  helm upgrade {{ .Release.Name }} <chart> --reset-then-reuse-values --set zec.logLevel=debug
 
 Accepted levels: trace, debug, info, warn, error, fatal, panic. debug and trace
 also turn on the conflist debug flag, which is the only channel zec-cni has.
+
+{{- $api := include "zenlayer-vpc-cni.apiserver" . | fromYaml }}
+{{- if $api.host }}
+
+APISERVER: the daemon{{ if and (eq .Values.zec.ipamType "crd") ((.Values.controlplane).deployment).enabled }} and the controlplane connect{{ else }} connects{{ end }} to {{ $api.host }}:{{ $api.port | default "443" }}
+  directly{{ if not .Values.zec.k8sServiceHost }}, read from kube-public/cluster-info at this install /
+  upgrade. Run the upgrade again if that entry point changes{{ end }}.
+{{- end }}
 
 {{- if not .Values.zec.serviceCidr }}
 

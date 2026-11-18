@@ -75,6 +75,44 @@ func (q *priorityQueue) PopPrefer(id string) *poolItem {
 	return q.Pop()
 }
 
+// PopPreferWhere is PopPrefer restricted to entries ok accepts: it skips the
+// rest, leaving them queued, and returns nil when none is acceptable. Without
+// a usable prefer it takes the entry before puts first, the oldest on a tie.
+// A nil ok accepts every entry; a nil before orders by age alone.
+func (q *priorityQueue) PopPreferWhere(id string, ok func(*poolItem) bool, before func(a, b *poolItem) bool) *poolItem {
+	if ok == nil && before == nil {
+		return q.PopPrefer(id)
+	}
+	best := -1
+	for i := 0; i < q.Size(); i++ {
+		it := q.innerQueue[i]
+		if ok != nil && !ok(it) {
+			continue
+		}
+		if id != "" && it.res.GetID() == id {
+			best = i
+			break
+		}
+		if best < 0 {
+			best = i
+			continue
+		}
+		b := q.innerQueue[best]
+		switch {
+		case before != nil && before(it, b):
+			best = i
+		case before != nil && before(b, it):
+		case it.reserveBefore.Before(b.reserveBefore):
+			best = i
+		}
+	}
+	if best < 0 {
+		return nil
+	}
+	//nolint:errcheck // the heap holds *poolItem; see Remove
+	return heap.Remove(&q.innerQueue, best).(*poolItem)
+}
+
 // Remove drops the entry with the given id and returns it, or nil when the
 // queue does not hold it.
 func (q *priorityQueue) Remove(id string) *poolItem {

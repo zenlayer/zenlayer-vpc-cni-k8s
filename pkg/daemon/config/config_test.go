@@ -4,6 +4,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -238,7 +239,11 @@ func TestGetConfigFromFileWithMerge(t *testing.T) {
 // validConfig is a configuration PopulateAndValidate accepts. The tests below
 // start from it and change only what they are about.
 func validConfig() *Config {
+	manage := false
 	return &Config{
+		IPAMType:                  types.IPAMTypeDirect,
+		IPStack:                   string(types.IPStackIPv4),
+		ManageUntaggedENI:         &manage,
 		CredentialAccessKeyId:     "ak",
 		CredentialAccessKeySecret: "sk",
 		SecurityGroup:             "sg-1",
@@ -330,7 +335,7 @@ func TestPopulateAndValidateIPv6Billing(t *testing.T) {
 // a superset of the enum: a mode the schema lets through and the daemon rejects
 // fails at daemon start on every node instead of at install time.
 func TestPopulateAndValidateAcceptsStackModes(t *testing.T) {
-	for _, mode := range []string{"", string(types.IPStackIPv4), string(types.IPStackDual)} {
+	for _, mode := range []string{string(types.IPStackIPv4), string(types.IPStackDual)} {
 		t.Run("ipStack="+mode, func(t *testing.T) {
 			c := validConfig()
 			c.IPStack = mode
@@ -344,9 +349,6 @@ func TestPopulateAndValidateAcceptsStackModes(t *testing.T) {
 				t.Fatalf("PopulateAndValidate() with ipStack %q = %v, want nil", mode, err)
 			}
 			want := mode
-			if want == "" {
-				want = string(types.IPStackIPv4)
-			}
 			if c.IPStack != want {
 				t.Errorf("IPStack = %q, want %q", c.IPStack, want)
 			}
@@ -427,6 +429,18 @@ func TestPopulateAndValidateRejects(t *testing.T) {
 			name:    "ipv6-only is rejected as unimplemented, not as a typo",
 			mutate:  func(c *Config) { c.IPStack = string(types.IPStackIPv6) },
 			wantMsg: "(IPv6-only) is not implemented yet",
+		},
+		{
+			// No default: a default that changed in a later release would
+			// silently change the families an existing node serves.
+			name:    "unset ip stack",
+			mutate:  func(c *Config) { c.IPStack = "" },
+			wantMsg: "ipStack is not set",
+		},
+		{
+			name:    "unset manageUntaggedENI",
+			mutate:  func(c *Config) { c.ManageUntaggedENI = nil },
+			wantMsg: "manageUntaggedENI is not set",
 		},
 		{
 			name:    "unknown ip stack",
@@ -524,7 +538,6 @@ func TestPopulateAndValidateDefaults(t *testing.T) {
 		{"SubnetStatUpdateIntervalSec", c.SubnetStatUpdateIntervalSec, uint32(DefaultSubnetStatUpdateIntervalSec)},
 		{"PoolGCPeriodSec", c.PoolGCPeriodSec, uint32(DefaultGcProtectPeriodSec)},
 		{"NetworkMode", c.NetworkMode, types.ModeENIMultiIP},
-		{"IPStack", c.IPStack, string(types.IPStackIPv4)},
 		{"HealthAndDebugPort", c.HealthAndDebugPort, uint32(DefaultDebugPort)},
 	}
 	for _, ck := range checks {
@@ -895,7 +908,102 @@ func TestNoCredentialsAnywhereIsRejected(t *testing.T) {
 	if err := c.loadCredentialFromSecret(); err != nil {
 		t.Fatalf("loadCredentialFromSecret() error = %v", err)
 	}
+	// The daemon picks the node event reason by this sentinel.
+	if err := c.PopulateAndValidate(); !errors.Is(err, ErrNoCredentials) {
+		t.Fatalf("PopulateAndValidate() error = %v, want ErrNoCredentials", err)
+	}
+}
+
+// An unvalidated Config must not panic, and must not read unset as adoption:
+// adoption can detach and delete an interface the operator attached.
+func TestManageUntaggedUnsetIsNotAdoption(t *testing.T) {
+	var c Config
+	if c.ManageUntagged() {
+		t.Error("ManageUntagged() = true with the field unset, want false")
+	}
+	on := true
+	c.ManageUntaggedENI = &on
+	if !c.ManageUntagged() {
+		t.Error("ManageUntagged() = false with the field set to true")
+	}
+}
+
+// TestIPAMTypeIsRequired pins ipamType as a behavior switch with no default.
+func TestIPAMTypeIsRequired(t *testing.T) {
+	for _, v := range []types.IPAMType{"", "Direct", "controlplane"} {
+		c := validConfig()
+		c.IPAMType = v
+		if err := c.PopulateAndValidate(); err == nil {
+			t.Errorf("ipamType %q accepted", v)
+		}
+	}
+}
+
+func crdConfig() *Config {
+	return &Config{IPAMType: types.IPAMTypeCRD, IPStack: string(types.IPStackDual)}
+}
+
+// TestCRDModeAcceptsMinimalConfig: a crd daemon needs only ipamType and
+// ipStack; the rest is the controlplane's.
+func TestCRDModeAcceptsMinimalConfig(t *testing.T) {
+	c := crdConfig()
+	if err := c.PopulateAndValidate(); err != nil {
+		t.Fatalf("minimal crd config rejected: %v", err)
+	}
+	if c.NetworkMode != types.ModeENIMultiIP || c.PoolMonitorIntervalSec == 0 || c.HealthAndDebugPort == 0 {
+		t.Fatalf("defaults not filled: %+v", c)
+	}
+}
+
+// TestCRDModeRejectsPlatformSettings: a platform setting on a crd node would
+// be silently unused, so it is refused -- credentials above all, which a crd
+// node must not hold.
+func TestCRDModeRejectsPlatformSettings(t *testing.T) {
+	manage := true
+	for name, set := range map[string]func(*Config){
+		"credentials":   func(c *Config) { c.CredentialAccessKeyId, c.CredentialAccessKeySecret = "ak", "sk" },
+		"openAPIDomain": func(c *Config) { c.OpenAPIDomain = "example.com" },
+		"vpcID":         func(c *Config) { c.VpcID = "vpc-1" },
+		"subnets":       func(c *Config) { c.Subnets = []string{"subnet-1"} },
+		"securityGroup": func(c *Config) { c.SecurityGroup = "sg-1" },
+		"manage":        func(c *Config) { c.ManageUntaggedENI = &manage },
+		"ipv6 billing":  func(c *Config) { c.IPv6Bandwidth = 10 },
+		"pool sizing":   func(c *Config) { c.PoolTarget = 5 },
+		"subnet stats":  func(c *Config) { c.SubnetStatAgingSec = 40 },
+		"rate limit":    func(c *Config) { c.RateLimit = map[string]int{"x": 1} },
+		"ipStack unset": func(c *Config) { c.IPStack = "" },
+		"ipStack ipv6":  func(c *Config) { c.IPStack = string(types.IPStackIPv6) },
+	} {
+		c := crdConfig()
+		set(c)
+		if err := c.PopulateAndValidate(); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// poolTargetMax is ignored while the cap is probed, so a target above it is not
+// an error then.
+func TestPopulateAndValidateCapProbeIgnoresTargetMax(t *testing.T) {
+	c := validConfig()
+	c.PoolTargetCapProbe = true
+	c.PoolTarget, c.PoolTargetMax = 10, 5
+	if err := c.PopulateAndValidate(); err != nil {
+		t.Fatalf("PopulateAndValidate() error = %v, want nil under cap probe", err)
+	}
+	c = validConfig()
+	c.PoolTarget, c.PoolTargetMax = 10, 5
 	if err := c.PopulateAndValidate(); err == nil {
-		t.Fatal("PopulateAndValidate() error = nil, want missing credentials to be rejected")
+		t.Fatal("PopulateAndValidate() error = nil, want poolTarget > poolTargetMax rejected without cap probe")
+	}
+}
+
+// ipv6 is refused as unimplemented in crd mode too, not as an unknown value.
+func TestCRDModeIPv6NotImplemented(t *testing.T) {
+	c := crdConfig()
+	c.IPStack = string(types.IPStackIPv6)
+	err := c.PopulateAndValidate()
+	if err == nil || !strings.Contains(err.Error(), "not implemented yet") {
+		t.Fatalf("err %v; want the not-implemented answer", err)
 	}
 }

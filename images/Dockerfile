@@ -45,7 +45,10 @@ ARG COMMIT_ID
 ARG BRANCH
 WORKDIR /go/src/zenlayer-vpc-cni-k8s
 COPY . .
-RUN make bin VERSION=$VERSION COMMIT_ID=$COMMIT_ID BRANCH=$BRANCH
+# The node's two binaries only: the controlplane, which holds the OpenAPI
+# credentials, ships in its own image (images/controlplane.Dockerfile).
+# DEBUG=0: stripped, optimized release binaries (the Makefile defaults to 1).
+RUN make zec-cni zec-ipam DEBUG=0 VERSION=$VERSION COMMIT_ID=$COMMIT_ID BRANCH=$BRANCH
 
 FROM zeccni-base
 # Clear the build-time proxy so it does not leak into the runtime image.
@@ -65,4 +68,3 @@ RUN ln -s /zenlayer/zec-cni /bin/zec-cni && \
 RUN mkdir -p /script
 COPY script/bootstrap/* /script/
 RUN chmod +x /script/*.sh
-

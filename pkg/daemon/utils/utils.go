@@ -24,6 +24,10 @@ const (
 	// both tags, so one node never takes another node's interface for its own
 	// creation, and never deletes it when sweeping for leaked ones.
 	TagKeyInstanceID = "zenlayer:cni:instance-id"
+	// TagKeyClusterID names the cluster (the kube-system namespace's uid) whose
+	// node created the ENI. The controlplane's VPC-wide leak sweep leaves an
+	// interface carrying another cluster's id alone: clusters may share a VPC.
+	TagKeyClusterID = "zenlayer:cni:cluster-id"
 
 	// TagKeyNoManage opts an interface out of management by this daemon. Set it
 	// to "true" on any interface attached for another purpose -- storage,
@@ -37,12 +41,16 @@ const (
 )
 
 // CniENITags returns the tags identifying an ENI created by this daemon on this
-// instance.
-func CniENITags(instanceID string) map[string]string {
-	return map[string]string{
+// instance, in this cluster. An empty clusterID leaves the cluster tag off.
+func CniENITags(instanceID, clusterID string) map[string]string {
+	tags := map[string]string{
 		TagKeyCreatedBy:  TagValueCreatedBy,
 		TagKeyInstanceID: instanceID,
 	}
+	if clusterID != "" {
+		tags[TagKeyClusterID] = clusterID
+	}
+	return tags
 }
 
 // GetCniNicName builds the name given to an ENI this daemon creates. Only the

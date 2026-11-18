@@ -10,6 +10,22 @@ default. Rendering anyway would install a conflist that enforces nothing while
 the values file says policy is on, and the only symptom would be traffic that
 should have been blocked getting through.
 */ -}}
+{{- /*
+The behavior switches have no default (see the top of values.yaml). The schema
+already requires them; this repeats the check for a render that skips the
+schema, where an unset switch would otherwise fall back to 1.0.0's behavior or,
+for ipStack, render invalid JSON.
+*/ -}}
+{{- $switches := dict "zec.ipamType" .Values.zec.ipamType "zec.ipStack" .Values.zec.ipStack "cni.mode" (.Values.cni).mode "cilium.enabled" (.Values.cilium).enabled "networkPolicy.enabled" (.Values.networkPolicy).enabled }}
+{{- $crd := eq .Values.zec.ipamType "crd" }}
+{{- if or (not $crd) (.Values.controlplane).deployment.enabled }}
+  {{- $_ := set $switches "zec.manageUntaggedENI" .Values.zec.manageUntaggedENI }}
+{{- end }}
+{{- range $name, $value := $switches }}
+  {{- if kindIs "invalid" $value }}
+    {{- fail (printf "%s is required and has no default: pass it explicitly, or use helm upgrade --reset-then-reuse-values to keep a value set at install. Upgrading from 1.0.0, whose chart defaulted these switches, pass the values the release ran with: see the top of values.yaml." $name) }}
+  {{- end }}
+{{- end }}
 {{- if and .Values.networkPolicy.enabled (eq .Values.networkPolicy.provider "cilium") (not .Values.cilium.enabled) }}
   {{- fail "networkPolicy.enabled=true with provider \"cilium\" requires cilium.enabled=true. Without it the conflist does not chain cilium-cni, so NetworkPolicy objects would be accepted and never enforced. Set cilium.enabled=true (and deploy Cilium itself -- see docs/deploy-cilium-chained.md), or set networkPolicy.enabled=false." }}
 {{- end }}
@@ -30,7 +46,7 @@ warm-up, so the operator sees nodes that cannot create interfaces rather than a
 bad setting. The daemon validates this too; catching it here is what turns a
 cluster-wide CrashLoopBackOff into an install-time error.
 */ -}}
-{{- if eq .Values.zec.ipStack "dual" }}
+{{- if and (eq .Values.zec.ipStack "dual") (or (ne .Values.zec.ipamType "crd") ((.Values.controlplane).deployment).enabled) }}
   {{- if and (eq .Values.zec.ipv6InternetChargeType "ByTrafficPackage") (not (gt (float64 .Values.zec.ipv6PackageSize) 0.0)) }}
     {{- fail "zec.ipStack=dual with zec.ipv6InternetChargeType=\"ByTrafficPackage\" requires zec.ipv6PackageSize (TB, a positive multiple of 0.1). A traffic commitment has no safe default, so set one -- note --set keeps fractions as strings, so use --set-json or a values file. If this account is on an hourly billing period the platform refuses committed package sizes outright; use zec.ipv6InternetChargeType=\"ByBandwidth\" there instead." }}
   {{- end }}
@@ -49,8 +65,25 @@ data:
   # The OpenAPI credentials deliberately live in a Secret, not here -- the
   # daemon reads them from /etc/zec_secret/ (see .Values.zec.secretName).
   eni_conf: |
+{{- if $crd }}
+    {{- /*
+    ipamType crd: the node holds no credentials and configures nothing that
+    talks to the platform -- the controlplane does, from its own configuration.
+    The daemon refuses a platform setting here rather than leave it unused.
+    */}}
     {
       "networkMode": {{ .Values.zec.networkMode | quote }},
+      "ipamType": "crd",
+      "ipStack": {{ .Values.zec.ipStack | quote }},
+      "serviceCidr": {{ .Values.zec.serviceCidr | quote }},
+      "reconcileIntervalSec": {{ .Values.zec.reconcileIntervalSec | int | toJson }},
+      "poolMonitorIntervalSec": {{ .Values.zec.poolMonitorIntervalSec | int | toJson }},
+      "healthAndDebugPort": {{ .Values.zec.healthAndDebugPort | int | toJson }}
+    }
+{{- else }}
+    {
+      "networkMode": {{ .Values.zec.networkMode | quote }},
+      "ipamType": "direct",
       {{- /*
         Deliberately absent from values.yaml: overriding the OpenAPI host is
         only meaningful for Zenlayer-internal environments, and a customer who
@@ -82,18 +115,12 @@ data:
       "poolTargetMin": {{ .Values.zec.poolTargetMin | int | toJson }},
       "poolTargetMax": {{ .Values.zec.poolTargetMax | int | toJson }},
       "poolTargetCapProbe": {{ .Values.zec.poolTargetCapProbe | toJson }},
-      {{- /* Rendered explicitly rather than via `default`, which treats false
-             as empty and would turn an operator's explicit false back into
-             true. kindIs "invalid" is the only test that distinguishes unset
-             from false. Emitting the effective value rather than null keeps the
-             ConfigMap readable after a `helm upgrade --reuse-values`, which
-             carries the previous release's values forward and so does not pick
-             up a key added to values.yaml since. */}}
-      "manageUntaggedENI": {{ if kindIs "invalid" .Values.zec.manageUntaggedENI }}true{{ else }}{{ .Values.zec.manageUntaggedENI | toJson }}{{ end }},
+      "manageUntaggedENI": {{ .Values.zec.manageUntaggedENI | toJson }},
       "reconcileIntervalSec": {{ .Values.zec.reconcileIntervalSec | int | toJson }},
       "poolMonitorIntervalSec": {{ .Values.zec.poolMonitorIntervalSec | int | toJson }},
       "healthAndDebugPort": {{ .Values.zec.healthAndDebugPort | int | toJson }}
     }
+{{- end }}
   # CNI conflist installed to /etc/cni/net.d on each node.
   10-zenlayer-cni.conflist: |
 {{- if eq .Values.cni.mode "delegated" }}
@@ -127,7 +154,8 @@ data:
           "ipam": {
             "type": "zec-cni",
             "zec_mode": "ipam-only",
-            "install_host_routes": true
+            "install_host_routes": true,
+            "debug": {{ or (eq .Values.zec.logLevel "debug") (eq .Values.zec.logLevel "trace") }}
           },
           {{- /* Same reasoning as the chained conflist: exec'd by kubelet, so
                  it cannot read any pod env. */}}

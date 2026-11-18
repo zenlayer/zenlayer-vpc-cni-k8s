@@ -61,6 +61,15 @@ func (f IPStack) Support(s IPStack) bool {
 		(s == IPStackIPv6 && f == IPStackIPv6)
 }
 
-// IPAMType is the type of the ipamType config field. Nothing reads it and no
-// values are defined for it -- see pkg/daemon/config.
+// IPAMType picks who talks to the platform. It is a behavior switch with no
+// default, like ipStack.
 type IPAMType string
+
+const (
+	// IPAMTypeDirect: the daemon calls the OpenAPI itself, with the
+	// credentials mounted on every node.
+	IPAMTypeDirect IPAMType = "direct"
+	// IPAMTypeCRD: the daemon holds no credentials. It states what it needs in
+	// its node's ZecNode and the controlplane does the platform side.
+	IPAMTypeCRD IPAMType = "crd"
+)

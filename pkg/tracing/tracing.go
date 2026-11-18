@@ -34,9 +34,19 @@ const (
 
 	EventMetadataServiceAbnormal   = "MetadataServiceAbnormal"
 	EventCredentialServiceAbnormal = "CredentialServiceAbnormal"
+	EventOpenApiPermissionDenied   = "OpenApiPermissionDenied"
+	EventOpenApiUnreachable        = "OpenApiUnreachable"
+	EventNodeClockSkew             = "NodeClockSkew"
+
+	// EventENIExcluded: an interface of the node is outside the pod subnets
+	// and serves no new pod.
+	EventENIExcluded = "InterfaceExcluded"
 
 	EventAllocateResourceFailed = "AllocateResourceFailed"
 	EventReleaseResourceFailed  = "ReleaseResourceFailed"
+	EventAttachENIFailed        = "AttachENIFailed"
+
+	EventDaemonStartFailed = "DaemonStartFailed"
 )
 
 var (
@@ -89,6 +99,22 @@ func (t *Tracer) RecordNodeEvent(eventType, reason, message string) error {
 
 	t.nodeEvent(eventType, reason, message)
 	return nil
+}
+
+// maxEventMessage bounds an event message. A platform error can carry a whole
+// response body -- a gateway's HTML page, say -- and the event is read in
+// `kubectl describe`, where the first lines are what matters; the full text
+// stays in the log. Applied where events are written (pkg/k8s, the
+// controlplane), once: cutting an already cut message would mark it twice.
+const maxEventMessage = 512
+
+// TruncateMessage cuts msg to maxEventMessage runes for an event.
+func TruncateMessage(msg string) string {
+	r := []rune(msg)
+	if len(r) <= maxEventMessage {
+		return msg
+	}
+	return string(r[:maxEventMessage]) + "... (truncated; see the log)"
 }
 
 // RegisterEventRecorder registers the recorders on the default tracer.

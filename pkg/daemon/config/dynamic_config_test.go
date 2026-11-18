@@ -39,6 +39,8 @@ func (f *fakeK8s) GetLocalNode(context.Context) (*corev1.Node, error) {
 	return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1", Labels: f.nodeLabels}}, nil
 }
 
+func (f *fakeK8s) GetClusterID(context.Context) (string, error) { return "", nil }
+
 func (f *fakeK8s) GetConfigMap(_ context.Context, namespace, name string) (*corev1.ConfigMap, error) {
 	f.gotNamespace, f.gotName = namespace, name
 	if f.cmErr != nil {
@@ -60,6 +62,9 @@ func (f *fakeK8s) GetLocalCachedPod(string, string) (*corev1.Pod, error) { panic
 func (f *fakeK8s) SetSvcCIDR(*zecTypes.IPNetSet) error                   { panic("not called") }
 func (f *fakeK8s) GetServiceCIDR() *zecTypes.IPNetSet                    { panic("not called") }
 func (f *fakeK8s) RecordNodeEvent(string, string, string)                { panic("not called") }
+func (f *fakeK8s) RecordNodeEventSync(context.Context, string, string, string) error {
+	panic("not called")
+}
 func (f *fakeK8s) RecordPodEvent(string, string, string, string, string) error {
 	panic("not called")
 }

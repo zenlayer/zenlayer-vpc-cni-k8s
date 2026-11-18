@@ -56,7 +56,7 @@ func TestBuildResultSandboxStaysEmpty(t *testing.T) {
 // TestBuildResultOmitsRoutes pins that no routes are reported. A delegated IPAM
 // result contributes addresses and a gateway; the caller builds the pod's
 // routes from the device it created, and anything set here is dropped. Setting
-// them anyway would suggest a contract that is not being honoured.
+// them anyway would suggest a contract that is not being honored.
 func TestBuildResultOmitsRoutes(t *testing.T) {
 	result, err := buildResult("0.4.0",
 		netConf("10.0.0.12", "2001:db8::c", "10.0.0.0/20", "2001:db8::/96", "10.0.0.1", "fe80::1"), "eth0")

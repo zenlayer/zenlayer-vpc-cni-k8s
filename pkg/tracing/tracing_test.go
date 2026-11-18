@@ -3,7 +3,10 @@
 
 package tracing
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestUnregisteredTracerReportsFailure pins that a tracer with no recorder
 // registered reports it cannot record, rather than accepting the event.
@@ -55,5 +58,17 @@ func TestRegisteredRecordersReceiveEvents(t *testing.T) {
 	}
 	if podCalls != 1 {
 		t.Errorf("pod recorder called %d times, want 1", podCalls)
+	}
+}
+
+// A platform error can carry a whole response body; the event keeps the head.
+func TestTruncateMessage(t *testing.T) {
+	long := strings.Repeat("<html>", 200)
+	got := TruncateMessage(long)
+	if n := len([]rune(got)); n >= len(long) || !strings.HasSuffix(got, "(truncated; see the log)") {
+		t.Fatalf("got %d runes ending %q; want it cut and marked", n, got[max(0, len(got)-30):])
+	}
+	if short := "subnet is full"; TruncateMessage(short) != short {
+		t.Fatalf("a short message changed: %q", TruncateMessage(short))
 	}
 }

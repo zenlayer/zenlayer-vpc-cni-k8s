@@ -168,6 +168,14 @@ func (e *ENI) ToPb() *rpc.ENIInfo {
 	}
 }
 
+// Grouped is implemented by a resource released together with others: an
+// address lives on an interface, and the interface goes back only once nothing
+// on it is held. ShrinkGroup returns that group, and false when the group can
+// never be released, so draining it gains nothing.
+type Grouped interface {
+	ShrinkGroup() (string, bool)
+}
+
 // ENIIP is one allocation: a set of addresses on a particular network
 // interface, covering every family the node serves. It is the unit the pool
 // deals in, and it is indivisible -- an IPv4 and its IPv6 counterpart are
@@ -175,6 +183,15 @@ func (e *ENI) ToPb() *rpc.ENIInfo {
 type ENIIP struct {
 	ENI   *ENI
 	IPSet IPSet
+}
+
+// ShrinkGroup is the interface the address lives on; the instance's own
+// interface is never released.
+func (e *ENIIP) ShrinkGroup() (string, bool) {
+	if e.ENI == nil || e.ENI.IsPrimary {
+		return "", false
+	}
+	return e.ENI.ID, true
 }
 
 // GetID returns the interface id and the address set joined by a slash, so

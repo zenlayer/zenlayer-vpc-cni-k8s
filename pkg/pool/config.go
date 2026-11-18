@@ -69,6 +69,14 @@ type Config struct {
 	//
 	// Optional: with a nil hook GC releases on the records alone.
 	OwnerAlive func(owner string) bool
+
+	// CreateInBackground keeps the factory off the allocation path: an Allocate
+	// finding the pool empty waits for the worker to refill it instead of
+	// calling Create itself. For a factory whose Create waits on another party
+	// (crd mode waits up to a minute for the controlplane): Allocate would wait
+	// holding pauseLock, a GC would queue behind it, and every Release behind
+	// that GC.
+	CreateInBackground bool
 }
 
 func (c *Config) newPoolConfigInner() poolConfigInner {
@@ -131,6 +139,7 @@ func (p *poolImpl) setTarget(t int) {
 	p.configLock.Lock()
 	defer p.configLock.Unlock()
 	p.target = t
+	p.metricTarget.Set(float64(t))
 }
 
 func (p *poolImpl) getTargetMin() int {
@@ -143,6 +152,7 @@ func (p *poolImpl) setTargetMin(t int) {
 	p.configLock.Lock()
 	defer p.configLock.Unlock()
 	p.targetMin = t
+	p.metricTargetMin.Set(float64(t))
 }
 
 func (p *poolImpl) getMaxCapProbe() bool {

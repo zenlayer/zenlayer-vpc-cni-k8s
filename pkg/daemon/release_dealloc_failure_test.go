@@ -133,3 +133,54 @@ func TestReleaseKeepsRecordOnDeallocFailure(t *testing.T) {
 		})
 	}
 }
+
+// An address the pool gives back from an interface taking no new addresses
+// lowers the limit, so the daemon is told to recount; one from a usable
+// interface does not move it.
+func TestReleaseInValidOnForbiddenInterfaceTellsCapacity(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		forbid forbidReason
+		want   int
+	}{{"excluded", forbidNotPodSubnet, 1}, {"usable", forbidNone, 0}} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &halfwayAPI{initAPI: &initAPI{}}
+			f, eni, res := releaseFixture(t, api)
+			eni.forbidAssign = tc.forbid
+			told := 0
+			fn := func() { told++ }
+			f.onCapacity.Store(&fn)
+			if _, err := f.ReleaseInValid(res); err != nil {
+				t.Fatal(err)
+			}
+			if told != tc.want {
+				t.Fatalf("told %d times, want %d", told, tc.want)
+			}
+		})
+	}
+}
+
+// The pool's shrink gives addresses back through Release: on an interface
+// taking no new addresses that lowers the limit too.
+func TestReleaseOnForbiddenInterfaceTellsCapacity(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		forbid forbidReason
+		want   int
+	}{{"excluded", forbidNotPodSubnet, 1}, {"usable", forbidNone, 0}} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &halfwayAPI{initAPI: &initAPI{}}
+			f, eni, res := releaseFixture(t, api)
+			eni.forbidAssign = tc.forbid
+			told := 0
+			fn := func() { told++ }
+			f.onCapacity.Store(&fn)
+			if err := f.Release(res); err != nil {
+				t.Fatal(err)
+			}
+			if told != tc.want {
+				t.Fatalf("told %d times, want %d", told, tc.want)
+			}
+		})
+	}
+}

@@ -28,6 +28,7 @@ type quotaEC2 struct {
 	attachErr   error
 	attachCalls int
 	deleteCalls int
+	deleteErr   error
 	// The two address assigns createENI makes on a freshly created interface,
 	// before it is attached.
 	assignV4Err error
@@ -60,7 +61,7 @@ func (q *quotaEC2) AssignNetworkInterfaceIpv6(string, ec2.IPv6Billing) (*zecApi.
 
 func (q *quotaEC2) DeleteNetworkInterface(string) (*zecApi.DeleteNetworkInterfaceResponse, error) {
 	q.deleteCalls++
-	return nil, nil
+	return nil, q.deleteErr
 }
 
 // v6BlockEC2 refuses the IPv6 prefix assign. The describe inherited from
@@ -314,4 +315,73 @@ func TestCreateAndAttachENIStopOnQuotaRefusals(t *testing.T) {
 			})
 		}
 	})
+}
+
+// An exhausted subnet ends the create backoff after one attempt, like a quota
+// refusal: nothing frees an address while the backoff runs. The create call
+// words it INVALID_SUBNET_IPV4_INSUFFICIENT; without it in the list the call
+// spent about two minutes before the caller could try another subnet.
+func TestCreateENIStopsOnExhaustedSubnet(t *testing.T) {
+	for _, code := range []string{apiErr.INVALID_SUBNET_IPV4_INSUFFICIENT, apiErr.OPERATION_DENIED_SUBNET_IP_INSUFFICIENT} {
+		t.Run(code, func(t *testing.T) {
+			fake := &quotaEC2{
+				countingEC2: &countingEC2{},
+				createErr:   zecCom.NewZenlayerCloudSdkError(code, "refused", "req-4"),
+			}
+			e := newQuotaAPI(fake)
+
+			start := time.Now()
+			_, err := e.AllocENI("subnet-1", "sg-1", 2)
+			if err == nil {
+				t.Fatal("AllocENI succeeded although the create was refused")
+			}
+			if fake.createCalls != 1 {
+				t.Errorf("CreateNetworkInterface was called %d times for %s, want exactly 1", fake.createCalls, code)
+			}
+			if !(&apiErr.OpenApiErrCodeChain{}).WithErrCodes(code).ErrChainEqual(err) {
+				t.Errorf("the returned error no longer carries %s: %v", code, err)
+			}
+			if elapsed := time.Since(start); elapsed > 5*time.Second {
+				t.Errorf("AllocENI took %v for %s; an exhausted subnet must not back off", elapsed, code)
+			}
+		})
+	}
+}
+
+// A create whose answer was lost may have made an interface; a retry would
+// make a second one. One call, and the outcome stays unknown to the caller.
+func TestCreateENINotRetriedWhenOutcomeUnknown(t *testing.T) {
+	for _, err := range []error{
+		zecCom.NewZenlayerCloudSdkError(zecCom.NetworkError, "lost", ""),
+		zecCom.NewZenlayerCloudSdkError(zecCom.IoError, "lost", ""),
+		zecCom.NewZenlayerCloudSdkError(zecCom.JsonParseError, "lost", ""),
+		errors.New("connection reset by peer"),
+	} {
+		fake := &quotaEC2{countingEC2: &countingEC2{}, createErr: err}
+		_, got := newQuotaAPI(fake).AllocENI("subnet-1", "sg-1", 2)
+		if got == nil || fake.createCalls != 1 || !OutcomeUnknown(got) {
+			t.Errorf("%v: %d create calls, err %v; want 1 and an unknown outcome", err, fake.createCalls, got)
+		}
+	}
+}
+
+// A refused assign on a new interface whose rollback delete fails too leaves
+// the interface on the platform: the error says so.
+func TestCreateENIFailedRollbackIsLeftBehind(t *testing.T) {
+	fake := &quotaEC2{
+		countingEC2: &countingEC2{},
+		assignV4Err: zecCom.NewZenlayerCloudSdkError(apiErr.OPERATION_DENIED_SUBNET_IP_INSUFFICIENT, "full", "req-5"),
+		deleteErr:   zecCom.NewZenlayerCloudSdkError(apiErr.InvalidNicStatus, "busy", "req-6"),
+	}
+	_, err := newQuotaAPI(fake).AllocENI("subnet-1", "sg-1", 3)
+	if !errors.Is(err, ErrENILeftBehind) {
+		t.Fatalf("err %v; want ErrENILeftBehind", err)
+	}
+	if !(&apiErr.OpenApiErrCodeChain{}).WithErrCodes(apiErr.OPERATION_DENIED_SUBNET_IP_INSUFFICIENT).ErrChainEqual(err) {
+		t.Fatalf("the assign's code is no longer reachable: %v", err)
+	}
+	fake.deleteErr = nil
+	if _, err := newQuotaAPI(fake).AllocENI("subnet-1", "sg-1", 3); err == nil || errors.Is(err, ErrENILeftBehind) {
+		t.Fatalf("err %v after a rollback that worked; want a plain error", err)
+	}
 }

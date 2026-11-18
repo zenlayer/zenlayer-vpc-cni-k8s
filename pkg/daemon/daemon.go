@@ -86,6 +86,11 @@ type ipamDaemon struct {
 	eniIPManager        *eniIPResourceManager
 	managers            map[string]ResourceManager // NetResourceType - ResourceManager
 	devicePluginManager deviceplugin.Manager
+	// capacityNudge asks the device plugin watcher to recount now. A pod that
+	// holds an address without requesting the resource changes the advertised
+	// figure the moment it starts or goes; the 5-minute tick alone left it
+	// that stale. Nil when the device plugin is disabled.
+	capacityNudge chan struct{}
 
 	// gcMu serializes gc: the periodic tick and the WakeGC signal can fire at
 	// the same time, and two concurrent GCs over the same pool would race.
@@ -165,6 +170,10 @@ func (d *ipamDaemon) gc() {
 	// indistinguishable from an outage to a starting pod.
 	start := time.Now()
 	defer func() {
+		// GC frees drained interfaces, which moves the limit; addresses the
+		// pool gives back afterwards from its invalid queue are recounted as
+		// each goes (eniIPFactory.onCapacity).
+		d.nudgeCapacity()
 		elapsed := time.Since(start)
 		// The warning is emitted before branching on err on purpose. A GC only
 		// gets slow because something upstream is timing out, so the failure
@@ -262,6 +271,36 @@ func NewKubernetesClient() (*kubernetes.Clientset, error) {
 	return kubernetes.NewForConfig(c)
 }
 
+// startFailureEventTimeout bounds the one API call reportStartFailure makes, so
+// an unreachable API server does not hold up the exit it is reporting.
+const startFailureEventTimeout = 5 * time.Second
+
+// reportStartFailure records why the daemon failed to start as a node event,
+// under the OpenAPI reason when err carries one so the platform can tell a
+// rejected credential from an unreachable endpoint. A stop requested while
+// starting is not a failure: a rolling update landing mid-start would report one.
+func reportStartFailure(runCtx context.Context, k k8s.K8sService, err error) {
+	if err == nil || runCtx.Err() != nil || errors.Is(err, context.Canceled) {
+		return
+	}
+	reason := startFailureReason(err)
+	ctx, cancel := context.WithTimeout(context.Background(), startFailureEventTimeout)
+	defer cancel()
+	if evErr := k.RecordNodeEventSync(ctx, v1.EventTypeWarning, reason, err.Error()); evErr != nil {
+		log.Warnf("Failed to record start failure on the node, %v", evErr)
+	}
+}
+
+func startFailureReason(err error) string {
+	if errors.Is(err, config.ErrNoCredentials) {
+		return tracing.EventCredentialServiceAbnormal
+	}
+	if reason := apiErr.OpenAPIErrEventReason(err); reason != "" {
+		return reason
+	}
+	return tracing.EventDaemonStartFailed
+}
+
 // NewIpamDaemon builds the daemon: it resolves this node's identity, loads and
 // validates the configuration, opens the platform client and the record store,
 // and brings up the resource manager, the warm pool and the periodic reconcile.
@@ -269,7 +308,7 @@ func NewKubernetesClient() (*kubernetes.Clientset, error) {
 // Anything wrong with the configuration is reported here rather than deferred,
 // because a node that starts and then serves addresses from the wrong subnet is
 // far harder to diagnose than one that refuses to start and says why.
-func NewIpamDaemon(ctx context.Context) (*ipamDaemon, error) {
+func NewIpamDaemon(ctx context.Context) (_ *ipamDaemon, retErr error) {
 	var (
 		namespace string
 		nodeName  string
@@ -304,6 +343,12 @@ func NewIpamDaemon(ctx context.Context) (*ipamDaemon, error) {
 	// a different route (the RecordEvent RPC below calls d.k8s directly).
 	tracing.RegisterEventRecorder(k8s.RecordNodeEvent, k8s.RecordPodEvent)
 
+	// A failure from here on exits the process, taking the event queue with it,
+	// so the cause is written to the node synchronously. Otherwise a node stuck
+	// in CrashLoopBackOff on a rejected credential or an unreachable OpenAPI
+	// shows nothing outside the pod log. Run covers the steps after this returns.
+	defer func() { reportStartFailure(ctx, k8s, retErr) }()
+
 	podPersist, err := newPodPersistenceManager(resourceDBPath, "pod")
 	if err != nil {
 		return nil, fmt.Errorf("create persistence db failed: %w", err)
@@ -323,6 +368,10 @@ func NewIpamDaemon(ctx context.Context) (*ipamDaemon, error) {
 	err = k8s.SetSvcCIDR(svcCIDR)
 	if err != nil {
 		return nil, err
+	}
+
+	if cfg.IPAMType == types.IPAMTypeCRD {
+		return newCRDIpamDaemon(ctx, cfg, k8s, podPersist, namespace, nodeName)
 	}
 
 	_zecClient, err := ec2.NewZecClient(cfg.CredentialAccessKeyId, cfg.CredentialAccessKeySecret, cfg.OpenAPIDomain)
@@ -347,7 +396,7 @@ func NewIpamDaemon(ctx context.Context) (*ipamDaemon, error) {
 	}
 	err = subnetManager.FlushSubnets(cfg.Subnets...)
 	if err != nil {
-		return nil, fmt.Errorf("set subnets failed, %v", err)
+		return nil, fmt.Errorf("set subnets failed, %w", err)
 	}
 
 	// Every configured subnet has to carry every family the node will hand out,
@@ -364,15 +413,23 @@ func NewIpamDaemon(ctx context.Context) (*ipamDaemon, error) {
 	secGrpManager := helper.NewSecurityGroupManager()
 	err = secGrpManager.UpdateSecurityGroup(cfg.SecurityGroup)
 	if err != nil {
-		return nil, fmt.Errorf("set SecurityGroup failed, %v", err)
+		return nil, fmt.Errorf("set SecurityGroup failed, %w", err)
 	}
 
+	// Tagged on the interfaces this node creates, for the controlplane's sweep
+	// should the cluster move to ipamType crd. This daemon's own sweep keeps to
+	// its own instance's interfaces and needs no cluster id, so a failure only
+	// leaves the tag off.
+	clusterID, err := k8s.GetClusterID(ctx)
+	if err != nil {
+		log.Warnf("Interfaces this node creates will carry no cluster id: %v", err)
+	}
 	zecApi, err := helper.New(zecClient, types.IPStack(cfg.IPStack), subnetManager, instanceMeta, ec2.IPv6Billing{
 		InternetChargeType: cfg.IPv6InternetChargeType,
 		BandwidthMbps:      cfg.IPv6Bandwidth,
 		PackageSizeTB:      cfg.IPv6PackageSize,
 		ClusterId:          cfg.IPv6ClusterId,
-	}, cfg.ManageUntagged())
+	}, cfg.ManageUntagged(), clusterID)
 	if err != nil {
 		return nil, err
 	}
@@ -399,7 +456,7 @@ func NewIpamDaemon(ctx context.Context) (*ipamDaemon, error) {
 	}
 	err = d.syncPodPersistence()
 	if err != nil {
-		return nil, fmt.Errorf("sync pod persistence failed while daemon init, %v", err)
+		return nil, fmt.Errorf("sync pod persistence failed while daemon init, %w", err)
 	}
 	oldPods, err := podPersist.List()
 	if err != nil {
@@ -414,7 +471,7 @@ func NewIpamDaemon(ctx context.Context) (*ipamDaemon, error) {
 		d.eniIPManager, err = newEniIPResourceManager(cfg, subnetManager, secGrpManager,
 			zecApi, allocatedResMap[zecTypes.NetResourceTypeEniIp], k8s)
 		if err != nil {
-			return nil, fmt.Errorf("create eniIP resource manager failed, %v", err)
+			return nil, fmt.Errorf("create eniIP resource manager failed, %w", err)
 		}
 		d.managers[zecTypes.NetResourceTypeEniIp] = d.eniIPManager
 
@@ -423,19 +480,10 @@ func NewIpamDaemon(ctx context.Context) (*ipamDaemon, error) {
 		// no-op manager, so that "this node advertises nothing" stays visible in
 		// the daemon's own state instead of hiding behind a manager that accepts
 		// every call and does nothing with it.
-		if !cfg.DisableDevicePlugin {
-			d.devicePluginManager = deviceplugin.NewResourcePluginManager(context.TODO(),
-				deviceplugin.NewENIDevicePlugin(deviceplugin.ENIIPResourceName,
-					max(0, d.eniIPManager.GetResourceLimit()-d.GetStockPodCount())))
-
-			sigChannel := make(chan struct{}, 1)
-			d.instanceLimit.WatchUpdate("device-plugin-eniip", sigChannel)
-			go watchResourceNum(context.TODO(), d.devicePluginManager, deviceplugin.ENIIPResourceName, func() int {
-				return max(0, d.eniIPManager.GetResourceLimit()-d.GetStockPodCount())
-			}, sigChannel)
-		} else {
-			log.Warn("Device plugin disabled by config: the scheduler will not see this " +
-				"node's eni-ip capacity, so pods must be bounded some other way")
+		d.startDevicePlugin()
+		if f := d.eniIPManager.factory; f != nil {
+			nudge := d.nudgeCapacity
+			f.onCapacity.Store(&nudge)
 		}
 	default:
 		return nil, fmt.Errorf("no support network mode %s", d.networkMode)
@@ -477,6 +525,25 @@ func (d *ipamDaemon) GetStockPodCount() int {
 		}
 	}
 	return count
+}
+
+// nudgeCapacity asks for a recount without waiting: a pending request already
+// covers this one.
+func (d *ipamDaemon) nudgeCapacity() {
+	if d.capacityNudge == nil {
+		return
+	}
+	select {
+	case d.capacityNudge <- struct{}{}:
+	default:
+	}
+}
+
+// countsAsStock reports whether pod is one GetStockPodCount counts: on the pod
+// network without requesting the resource. A pod no longer in the cache may
+// have been, so it counts.
+func countsAsStock(pod *v1.Pod) bool {
+	return pod == nil || (!isHostNetwork(pod) && !hasRequestAndLimitsFields(pod))
 }
 
 func watchResourceNum(ctx context.Context, pluginManger deviceplugin.Manager, resName string, lister func() int, updateSignal <-chan struct{}) {
@@ -571,30 +638,7 @@ func (d *ipamDaemon) startDebugServer() (*http.Server, error) {
 // warning and a skip, which is indistinguishable from "the platform is slow" --
 // see the caller for what that degrades into.
 func validateSubnetsForStack(subnets helper.SubnetManager, ipStack types.IPStack, ids []string) error {
-	families := ipStack.Families()
-	if len(families) == 0 {
-		return fmt.Errorf("ipStack %q enables no address family", ipStack)
-	}
-	// Every mode is checked, single-family ones included, and per CIDR rather
-	// than by comparing IPStack values: a subnet with no CIDR at all reports
-	// itself as IPv4 (PodSubnet.IPStack), so on an ipv4-only node a stack
-	// comparison would find nothing wrong and the missing CIDR would surface one
-	// failed pod at a time.
-	for _, id := range ids {
-		subnet := subnets.GetPodSubnet(id)
-		if subnet == nil {
-			return fmt.Errorf("ipStack %s requires subnet %s, which could not be read", ipStack, id)
-		}
-		for _, f := range families {
-			if subnet.Cidr(f) != "" {
-				continue
-			}
-			return fmt.Errorf("ipStack %s needs every subnet to carry %s, but subnet %s has no %s cidr "+
-				"(ipv4Cidr=%q ipv6Cidr=%q) -- give it one, or set zec.ipStack to a mode it can serve",
-				ipStack, f, id, f, subnet.Cidr(zecTypes.IPFamilyV4), subnet.Cidr(zecTypes.IPFamilyV6))
-		}
-	}
-	return nil
+	return helper.ValidateSubnetsForStack(subnets, ipStack, ids)
 }
 
 func (d *ipamDaemon) syncPodPersistence() error {
@@ -633,7 +677,11 @@ func (d *ipamDaemon) syncPodPersistence() error {
 		// server directly before acting on a record, and treat any answer that
 		// is not a definite NotFound as "still there" -- a broken connection
 		// must not be read as every pod on this node having gone away.
-		if _, getErr := d.k8s.GetPod(context.Background(), pod.Namespace, pod.Name); getErr == nil {
+		// Bounded: this runs inside pool.GC with the whole pool paused.
+		getCtx, cancel := context.WithTimeout(context.Background(), ownerAliveAPITimeout)
+		_, getErr := d.k8s.GetPod(getCtx, pod.Namespace, pod.Name)
+		cancel()
+		if getErr == nil {
 			delete(d.staleSince, key)
 			continue
 		} else if !apiErrors.IsNotFound(getErr) {
@@ -669,6 +717,7 @@ func (d *ipamDaemon) syncPodPersistence() error {
 			return fmt.Errorf("delete pod[%s] in persistence failed: %w", pod.Name, err)
 		}
 		delete(d.staleSince, key)
+		d.nudgeCapacity()
 	}
 
 	// Drop marks for records that are no longer stored at all, so the map
@@ -794,10 +843,15 @@ func (d *ipamDaemon) judgmentEvictPod(ctx *netContext, resourceLimit int) error 
 		// name the knob rather than a formula: with capacity probing off it is
 		// poolTargetMax alone, and telling the user to resize the instance would
 		// change nothing.
+		budget := "(chart value zec.poolTargetMax, or zec.poolTargetCapProbe to take the cap from the " +
+			"instance type)"
+		if d.cfg != nil && d.cfg.IPAMType == types.IPAMTypeCRD {
+			// No pool sizing on a crd node: the figure is the controlplane's.
+			budget = "(the controlplane's capacity for it, `kubectl get zn` ALLOCATABLE: a larger instance type)"
+		}
 		info := fmt.Sprintf("this node can serve %d pod addresses and already holds %d pods, so "+
 			"there is none left; lower this node's maxPods, give it a larger address budget "+
-			"(chart value zec.poolTargetMax, or zec.poolTargetCapProbe to take the cap from the "+
-			"instance type), or remove the %s annotation from it so the add fails and it stays in "+
+			budget+", or remove the %s annotation from it so the add fails and it stays in "+
 			"ContainerCreating instead of being evicted",
 			resourceLimit, len(pods), zecTypes.EvictionPolicyAnnotation)
 		ctx.log.Infof("Pod evicted due to %s", info)
@@ -909,6 +963,11 @@ func (d *ipamDaemon) AllocIP(ctx context.Context, req *rpc.AllocIPRequest) (resp
 	if err != nil {
 		return &rpc.AllocIPResponse{Code: rpc.ErrorCode_K8SAPIError}, fmt.Errorf("get pod from cache failed, %v", err)
 	}
+	defer func() {
+		if err == nil && countsAsStock(k8sPod) {
+			d.nudgeCapacity()
+		}
+	}()
 
 	newPod := d.translatePod(k8sPod)
 	newPod.SandboxContainerId = req.K8SPodInfraContainerId
@@ -1090,6 +1149,9 @@ func (d *ipamDaemon) ReleaseIP(ctx context.Context, req *rpc.ReleaseIPRequest) (
 	if err != nil {
 		return &rpc.ReleaseIPResponse{Code: rpc.ErrorCode_WriteDBError}, fmt.Errorf("delete pod from db failed, %v", err)
 	}
+	// Any release can change the figure, not only a stock pod's: an address
+	// given back from an interface outside the pod subnets lowers the limit.
+	d.nudgeCapacity()
 	return &rpc.ReleaseIPResponse{Code: rpc.ErrorCode_Success}, nil
 }
 
@@ -1299,4 +1361,63 @@ func (d *ipamDaemon) RecordEvent(ctx context.Context, req *rpc.RecordEventReques
 		return reply, err
 	}
 	return reply, nil
+}
+
+// startDevicePlugin advertises the node's eni-ip capacity to the kubelet and
+// keeps it current as the instance limits change.
+func (d *ipamDaemon) startDevicePlugin() {
+	if !d.cfg.DisableDevicePlugin {
+		d.devicePluginManager = deviceplugin.NewResourcePluginManager(context.TODO(),
+			deviceplugin.NewENIDevicePlugin(deviceplugin.ENIIPResourceName,
+				max(0, d.eniIPManager.GetResourceLimit()-d.GetStockPodCount())))
+
+		sigChannel := make(chan struct{}, 1)
+		d.capacityNudge = sigChannel
+		d.instanceLimit.WatchUpdate("device-plugin-eniip", sigChannel)
+		go watchResourceNum(context.TODO(), d.devicePluginManager, deviceplugin.ENIIPResourceName, func() int {
+			return max(0, d.eniIPManager.GetResourceLimit()-d.GetStockPodCount())
+		}, sigChannel)
+	} else {
+		log.Warn("Device plugin disabled by config: the scheduler will not see this " +
+			"node's eni-ip capacity, so pods must be bounded some other way")
+	}
+}
+
+// newCRDIpamDaemon is NewIpamDaemon for ipamType crd: no OpenAPI client, no
+// subnet or security-group manager, no instance metadata from the platform --
+// the controlplane owns all of that and reports through the node's ZecNode.
+func newCRDIpamDaemon(ctx context.Context, cfg *config.Config, k8s k8s.K8sService, podPersist *podPersistenceManager,
+	namespace, nodeName string) (*ipamDaemon, error) {
+	d := &ipamDaemon{
+		networkMode:                cfg.NetworkMode,
+		namespace:                  namespace,
+		nodeName:                   nodeName,
+		cfg:                        cfg,
+		apiListenAddress:           defaultSocketPath,
+		pendingPods:                sync.Map{},
+		k8s:                        k8s,
+		podPersistenceManager:      podPersist,
+		managers:                   map[string]ResourceManager{},
+		UnimplementedCNIIpamServer: rpc.UnimplementedCNIIpamServer{},
+	}
+	if err := d.syncPodPersistence(); err != nil {
+		return nil, fmt.Errorf("sync pod persistence failed while daemon init, %w", err)
+	}
+	oldPods, err := podPersist.List()
+	if err != nil {
+		return nil, fmt.Errorf("list pod from persistence failed, %v", err)
+	}
+	allocatedResMap := zecTypes.GetNetResourceAllocatedFromPods(oldPods)
+	if d.networkMode != types.ModeENIMultiIP {
+		return nil, fmt.Errorf("no support network mode %s", d.networkMode)
+	}
+	var limit *crdLimit
+	d.eniIPManager, limit, err = newCRDResourceManager(ctx, cfg, k8s, nodeName, allocatedResMap[zecTypes.NetResourceTypeEniIp])
+	if err != nil {
+		return nil, fmt.Errorf("create eniIP resource manager failed, %w", err)
+	}
+	d.instanceLimit = limit
+	d.managers[zecTypes.NetResourceTypeEniIp] = d.eniIPManager
+	d.startDevicePlugin()
+	return d, nil
 }

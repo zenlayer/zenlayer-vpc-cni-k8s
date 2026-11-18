@@ -83,6 +83,22 @@ func TestAssignIsNotRetriedWhenThePlatformNeverAnswered(t *testing.T) {
 	}
 }
 
+// The SDK's own codes for a request that may not have arrived, or whose answer
+// was lost, are just as unknown as an uncoded error: one call, no retry.
+func TestAssignIsNotRetriedOnSDKTransportCodes(t *testing.T) {
+	for _, code := range []string{"NETWORK_ERROR", "IO_ERROR", "JSON_PARSE_FAILED"} {
+		fake := &assignEC2{countingEC2: &countingEC2{}, failFirst: -1,
+			assignErr: zecCom.NewZenlayerCloudSdkError(code, "lost", "")}
+		e := assignAPI(fake, pathMeta{})
+		if _, err := e.AllocIPv4Addresses("eni-1", testMac, 2); err == nil {
+			t.Fatalf("%s: AllocIPv4Addresses succeeded although every assign failed", code)
+		}
+		if fake.assignCalls != 1 {
+			t.Errorf("%s: %d assign calls, want 1", code, fake.assignCalls)
+		}
+	}
+}
+
 // TestAssignIsRetriedWhenThePlatformRejectedIt is the control. A platform error
 // code means the request arrived and was refused, so nothing was applied and a
 // retry is both safe and useful -- without this the assertion above would pass

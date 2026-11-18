@@ -13,6 +13,7 @@ package config
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -74,6 +75,11 @@ const (
 
 var (
 	log = zlog.GetLogger().WithFields(zlog.Fields{"subsys": "ipam"})
+
+	// ErrNoCredentials marks a config with no OpenAPI credential. It is caught
+	// before any OpenAPI call, so the daemon reports it under the credential
+	// event reason by matching this rather than an SDK error code.
+	ErrNoCredentials = errors.New("no credentials for the zenlayer api")
 )
 
 // Config is the ipam daemon's configuration.
@@ -104,11 +110,11 @@ type Config struct {
 	VpcID              string   `yaml:"vpcID" json:"vpcID"`
 	Subnets            []string `yaml:"subnets" json:"subnets"` // Subnets used by pods (actually used by ENI), All subnets must belong to the same vpcID
 	SecurityGroup      string   `yaml:"securityGroup" json:"securityGroup"`
-	// IPStack selects the address families served. Defaults to ipv4; dual is the
-	// other mode that runs. The validate and mod tags are inert -- no validator
-	// or defaulting library is wired up -- so the switch in PopulateAndValidate
-	// is the only gate, and the default is applied there by hand.
-	IPStack string `yaml:"ipStack" json:"ipStack" validate:"oneof=ipv4 ipv6 dual" mod:"default=ipv4"`
+	// IPStack selects the address families served: ipv4 or dual. Required, with
+	// no default, so a later release cannot change a node's families. The
+	// validate tag is inert -- no validator library is wired up -- so the checks
+	// in PopulateAndValidate are the only gate.
+	IPStack string `yaml:"ipStack" json:"ipStack" validate:"oneof=ipv4 ipv6 dual"`
 	// IPv6InternetChargeType and IPv6Bandwidth are what the platform charges for
 	// public IPv6 on an interface. They are required, not optional: enabling
 	// IPv6 on a NIC in a subnet whose ipv6Type is Public is refused outright
@@ -133,15 +139,16 @@ type Config struct {
 	// interface that is attached to this instance but was not created by it and
 	// is not exempted by the zenlayer:cni:no-manage tag.
 	//
-	// true (the default) adopts it if it sits in a configured pod subnet: its
-	// secondary addresses join the pool and it may be detached when the pool
-	// shrinks. false leaves it untouched, in which case it still consumes the
+	// false leaves it untouched, in which case it still consumes the
 	// instance's interface quota and so reduces the number of addresses this
-	// node can serve. See isManagedENI in pkg/daemon/factory.
+	// node can serve. true adopts it if it sits in a configured pod subnet: its
+	// secondary addresses join the pool and it may be detached and deleted when
+	// the pool shrinks. See isManagedENI in pkg/daemon/factory.
 	//
-	// A pointer so an unset field is distinguishable from an explicit false.
+	// Required, with no default: a pointer so PopulateAndValidate can refuse an
+	// unset field rather than read it as false.
 	ManageUntaggedENI           *bool            `yaml:"manageUntaggedENI" json:"manageUntaggedENI,omitempty"`
-	IPAMType                    types.IPAMType   `yaml:"ipamType" json:"ipamType"` // accepted but never read; no values are defined for it
+	IPAMType                    types.IPAMType   `yaml:"ipamType" json:"ipamType"` // direct or crd; required, see PopulateAndValidate
 	ExtraRoutes                 []zecTypes.Route `yaml:"extraRoutes" json:"extraRoutes,omitempty"`
 	DisableDevicePlugin         bool             `yaml:"disableDevicePlugin" json:"disableDevicePlugin"`
 	RateLimit                   map[string]int   `yaml:"rateLimit" json:"rateLimit"`
@@ -246,7 +253,11 @@ func (c *Config) loadCredentialFromSecret() error {
 	} {
 		data, err := os.ReadFile(item.path)
 		if os.IsNotExist(err) {
-			log.Warnf("Credential file %s not mounted, falling back to configmap", item.path)
+			// Expected with ipamType crd: the controlplane holds the
+			// credentials. Still read, so a mount there is refused.
+			if c.IPAMType != types.IPAMTypeCRD {
+				log.Warnf("Credential file %s not mounted, falling back to configmap", item.path)
+			}
 			continue
 		}
 		if err != nil {
@@ -260,11 +271,11 @@ func (c *Config) loadCredentialFromSecret() error {
 	return nil
 }
 
-// ManageUntagged reports the effective value of ManageUntaggedENI. Unset means
-// true: an untagged interface is adopted unless the operator says otherwise.
+// ManageUntagged reports ManageUntaggedENI. PopulateAndValidate refuses it
+// unset; the nil check only keeps an unvalidated Config from panicking.
 func (c *Config) ManageUntagged() bool {
 	if c.ManageUntaggedENI == nil {
-		return true
+		return false
 	}
 	return *c.ManageUntaggedENI
 }
@@ -273,12 +284,23 @@ func (c *Config) ManageUntagged() bool {
 // cannot run with. It is the whole of the validation: the struct tags above are
 // inert, so a field this function does not check is not checked at all.
 func (c *Config) PopulateAndValidate() error {
+	switch c.IPAMType {
+	case types.IPAMTypeDirect:
+	case types.IPAMTypeCRD:
+		return c.populateAndValidateCRD()
+	case "":
+		return fmt.Errorf("ipamType is not set in the cni configmap (chart value zec.ipamType): "+
+			"set it to %q or %q explicitly; it has no default", types.IPAMTypeDirect, types.IPAMTypeCRD)
+	default:
+		return fmt.Errorf("unsupported ipamType %q in the cni configmap: use %q or %q",
+			c.IPAMType, types.IPAMTypeDirect, types.IPAMTypeCRD)
+	}
 	if c.CredentialAccessKeyId == "" || c.CredentialAccessKeySecret == "" {
 		akPath, skPath := secretPaths()
-		return fmt.Errorf("no credentials for the zenlayer api: neither %s and %s were readable, "+
+		return fmt.Errorf("%w: neither %s and %s were readable, "+
 			"nor were credentialAccessKeyId and credentialAccessKeySecret set in the cni configmap. "+
 			"Create the secret the daemonset mounts (chart value zec.secretName) with the keys "+
-			"AccessKeyID and AccessKeyPassword", akPath, skPath)
+			"AccessKeyID and AccessKeyPassword", ErrNoCredentials, akPath, skPath)
 	}
 
 	if c.SecurityGroup == "" {
@@ -318,7 +340,8 @@ func (c *Config) PopulateAndValidate() error {
 		return fmt.Errorf("poolTargetMin (%d) must be less than or equal to poolTarget (%d) "+
 			"in the cni configmap (chart values zec.poolTargetMin, zec.poolTarget)", c.PoolTargetMin, c.PoolTarget)
 	}
-	if c.PoolTarget > c.PoolTargetMax {
+	// poolTargetMax is ignored while the cap is probed, so it bounds nothing.
+	if !c.PoolTargetCapProbe && c.PoolTarget > c.PoolTargetMax {
 		return fmt.Errorf("poolTarget (%d) must be less than or equal to poolTargetMax (%d) "+
 			"in the cni configmap (chart values zec.poolTarget, zec.poolTargetMax)", c.PoolTarget, c.PoolTargetMax)
 	}
@@ -359,10 +382,17 @@ func (c *Config) PopulateAndValidate() error {
 	}
 	log.WithField("NetworkMode", c.NetworkMode).Info("config loaded")
 
+	// ipStack and manageUntaggedENI have no default: a default that changed in
+	// a later release would silently change what an existing node does.
 	if c.IPStack == "" {
-		c.IPStack = string(types.IPStackIPv4)
+		return fmt.Errorf("ipStack is not set in the cni configmap (chart value zec.ipStack): "+
+			"set it to %q or %q explicitly; it has no default", types.IPStackIPv4, types.IPStackDual)
 	}
 	log.WithField("IPStack", c.IPStack).Info("config loaded")
+	if c.ManageUntaggedENI == nil {
+		return fmt.Errorf("manageUntaggedENI is not set in the cni configmap (chart value " +
+			"zec.manageUntaggedENI): set it to true or false explicitly; it has no default")
+	}
 
 	if c.HealthAndDebugPort == 0 {
 		c.HealthAndDebugPort = DefaultDebugPort
@@ -370,7 +400,7 @@ func (c *Config) PopulateAndValidate() error {
 	log.WithField("HealthAndDebugPort", c.HealthAndDebugPort).Info("config loaded")
 
 	switch c.IPStack {
-	case "", string(types.IPStackIPv4), string(types.IPStackDual):
+	case string(types.IPStackIPv4), string(types.IPStackDual):
 	case string(types.IPStackIPv6):
 		// Refused as unimplemented, not as a typo -- the message has to say
 		// which it is. Three things are missing and each fails silently:
@@ -408,7 +438,7 @@ func (c *Config) PopulateAndValidate() error {
 				return fmt.Errorf("ipv6PackageSize %v is not a multiple of 0.1, which the platform requires", c.IPv6PackageSize)
 			}
 			if c.IPv6PackageSize <= 0 {
-				return fmt.Errorf("ipv6InternetChargeType %q requires ipv6PackageSize (TB, 0 or a multiple of 0.1) -- "+
+				return fmt.Errorf("ipv6InternetChargeType %q requires ipv6PackageSize (TB, a positive multiple of 0.1) -- "+
 					"a traffic commitment has no safe default, so set one; if this account is on an hourly billing "+
 					"period the platform refuses committed package sizes outright and %q applies instead",
 					c.IPv6InternetChargeType, IPv6ChargeByBandwidth)
@@ -479,4 +509,75 @@ func LoadConfig(ctx context.Context, k8s k8s.K8sService, namespace, nodeName str
 	}
 	log.WithField("config", config.String()).Info("config loaded")
 	return config, nil
+}
+
+// populateAndValidateCRD validates the configuration of a daemon in ipamType
+// crd. Everything that talks to the platform belongs to the controlplane's own
+// configuration, and the warm-pool sizing arrives in the node's ZecNode, so a
+// value for any of them here would be silently unused -- it is refused
+// instead, naming where the setting now lives.
+func (c *Config) populateAndValidateCRD() error {
+	const moved = "it belongs to the controlplane's configuration"
+	type field struct {
+		name string
+		set  bool
+		why  string
+	}
+	for _, f := range []field{
+		{"credentials (the zec.secretName Secret, credentialAccessKeyId/Secret)", c.CredentialAccessKeyId != "" || c.CredentialAccessKeySecret != "", moved},
+		{"openAPIDomain", c.OpenAPIDomain != "", moved},
+		{"vpcID", c.VpcID != "", moved},
+		{"subnets", len(c.Subnets) > 0, moved},
+		{"securityGroup", c.SecurityGroup != "", moved},
+		{"manageUntaggedENI", c.ManageUntaggedENI != nil, moved},
+		{"ipv6InternetChargeType / ipv6Bandwidth / ipv6PackageSize / ipv6ClusterId",
+			c.IPv6InternetChargeType != "" || c.IPv6Bandwidth != 0 || c.IPv6PackageSize != 0 || c.IPv6ClusterId != "", moved},
+		{"poolTarget / poolTargetMin / poolTargetMax / poolTargetCapProbe",
+			c.PoolTarget != 0 || c.PoolTargetMin != 0 || c.PoolTargetMax != 0 || c.PoolTargetCapProbe,
+			moved + " (pool sizing: its scaler)"},
+		{"poolCapRatio / subnetStatAgingSec / subnetStatUpdateIntervalSec",
+			c.PoolCapRatio != 0 || c.SubnetStatAgingSec != 0 || c.SubnetStatUpdateIntervalSec != 0,
+			"it has no effect and no controlplane counterpart"},
+		{"rateLimit", len(c.RateLimit) > 0,
+			moved + " (its rateLimit takes readQPS, readBurst, writeQPS, writeBurst)"},
+	} {
+		if f.set {
+			return fmt.Errorf("%s is set in the cni configmap, but with ipamType %q %s; remove it here",
+				f.name, types.IPAMTypeCRD, f.why)
+		}
+	}
+	switch c.IPStack {
+	case string(types.IPStackIPv4), string(types.IPStackDual):
+	case "":
+		return fmt.Errorf("ipStack is not set in the cni configmap (chart value zec.ipStack): "+
+			"set it to %q or %q explicitly; it has no default", types.IPStackIPv4, types.IPStackDual)
+	case string(types.IPStackIPv6):
+		// Unimplemented, not a typo: same answer as the direct path above.
+		return fmt.Errorf("ipStack %q (IPv6-only) is not implemented yet: use %q for dual-stack, or %q",
+			c.IPStack, types.IPStackDual, types.IPStackIPv4)
+	default:
+		return fmt.Errorf("unsupported ipStack %q in configMap: use %q or %q",
+			c.IPStack, types.IPStackIPv4, types.IPStackDual)
+	}
+	if c.NetworkMode == "" {
+		c.NetworkMode = types.ModeENIMultiIP
+	}
+	if c.NetworkMode != types.ModeENIMultiIP {
+		return fmt.Errorf("unsupported daemon mode %q: the only mode this daemon implements is %q",
+			c.NetworkMode, types.ModeENIMultiIP)
+	}
+	if c.ReconcileIntervalSec == 0 {
+		c.ReconcileIntervalSec = DefaultReconcileIntervalSec
+	}
+	if c.PoolMonitorIntervalSec == 0 {
+		c.PoolMonitorIntervalSec = DefaultPoolMonitorIntervalSec
+	}
+	if c.PoolGCPeriodSec == 0 {
+		c.PoolGCPeriodSec = DefaultGcProtectPeriodSec
+	}
+	if c.HealthAndDebugPort == 0 {
+		c.HealthAndDebugPort = DefaultDebugPort
+	}
+	log.WithFields(map[string]interface{}{"ipamType": c.IPAMType, "ipStack": c.IPStack}).Info("config loaded")
+	return nil
 }

@@ -16,7 +16,7 @@ require (
 	github.com/sirupsen/logrus v1.9.3
 	github.com/vishvananda/netlink v1.2.1-beta.2
 	github.com/vishvananda/netns v0.0.4
-	github.com/zenlayer/zenlayercloud-sdk-go v0.2.52
+	github.com/zenlayer/zenlayercloud-sdk-go v0.2.59
 	go.etcd.io/bbolt v1.5.0
 	golang.org/x/net v0.40.0
 	golang.org/x/sync v0.20.0

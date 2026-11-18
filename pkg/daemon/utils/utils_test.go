@@ -49,7 +49,7 @@ func TestGetCniNicNameIsDeterministic(t *testing.T) {
 // created-by alone would let one node manage another node's interfaces.
 func TestCniENITagsCarryBothClaims(t *testing.T) {
 	const instanceID = "1755670178034880550"
-	tags := CniENITags(instanceID)
+	tags := CniENITags(instanceID, "")
 
 	if len(tags) != 2 {
 		t.Fatalf("CniENITags returned %d tags, want 2: %v", len(tags), tags)
@@ -62,8 +62,20 @@ func TestCniENITagsCarryBothClaims(t *testing.T) {
 	}
 
 	// Two nodes must never produce the same instance-id claim.
-	if CniENITags("node-a")[TagKeyInstanceID] == CniENITags("node-b")[TagKeyInstanceID] {
+	if CniENITags("node-a", "")[TagKeyInstanceID] == CniENITags("node-b", "")[TagKeyInstanceID] {
 		t.Error("CniENITags produced the same instance-id for two different instances")
+	}
+}
+
+// The cluster tag is written when the cluster id is known and left off when it
+// is not: an empty value would read as "no cluster" to the sweep anyway, and a
+// tag with no value is noise on the interface.
+func TestCniENITagsClusterID(t *testing.T) {
+	if got := CniENITags("i-1", "uid-a")[TagKeyClusterID]; got != "uid-a" {
+		t.Errorf("cluster tag = %q, want uid-a", got)
+	}
+	if _, ok := CniENITags("i-1", "")[TagKeyClusterID]; ok {
+		t.Error("cluster tag written with no cluster id")
 	}
 }
 

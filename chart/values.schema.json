@@ -5,6 +5,9 @@
   "required": [
     "image",
     "zec",
+    "cni",
+    "cilium",
+    "networkPolicy",
     "resources"
   ],
   "additionalProperties": false,
@@ -41,15 +44,12 @@
     "zec": {
       "type": "object",
       "required": [
-        "vpcID",
-        "subnetIDs",
-        "securityGroupID",
-        "secretName"
+        "ipStack",
+        "ipamType"
       ],
       "properties": {
         "vpcID": {
           "type": "string",
-          "minLength": 1,
           "description": "Zenlayer VPC ID. All subnets must belong to it."
         },
         "subnetIDs": {
@@ -58,13 +58,11 @@
             "type": "string",
             "minLength": 1
           },
-          "minItems": 1,
           "maxItems": 5,
-          "description": "Subnets pods draw secondary IPs from. The daemon rejects more than 5 (config.MaxSubnetNum)."
+          "description": "The only subnets pod addresses come from. The node's primary interface serves pods only when its subnet is listed. At most 5."
         },
         "securityGroupID": {
-          "type": "string",
-          "minLength": 1
+          "type": "string"
         },
         "secretName": {
           "type": "string",
@@ -91,7 +89,7 @@
             "ipv4",
             "dual"
           ],
-          "description": "Address families given to pods. \"dual\" requires every subnet in zec.subnetIDs to carry both an IPv4 and an IPv6 CIDR; the daemon refuses to start otherwise rather than quietly serving only one family. IPv6-only is rejected by the daemon with a message saying so -- the code paths are family-generic but capacity reporting, the service CIDR lookup and new-ENI address stripping are not finished for it."
+          "description": "Address families given to pods. \"dual\" requires every subnet in zec.subnetIDs to carry both an IPv4 and an IPv6 CIDR; the daemon refuses to start otherwise rather than quietly serving only one family. IPv6-only is refused here: it is not implemented (capacity reporting, the IPv4 service-CIDR requirement, and the IPv4 address every new interface comes with)."
         },
         "ipv6InternetChargeType": {
           "enum": [
@@ -104,13 +102,13 @@
         "ipv6Bandwidth": {
           "type": "integer",
           "minimum": 1,
-          "description": "Public IPv6 cap in Mbps per interface, used only when ipStack is \"dual\". Bounds what a single runaway pod can spend."
+          "description": "Public IPv6 cap in Mbps per interface, shared by every pod on that interface; used only when ipStack is \"dual\"."
         },
         "ipv6PackageSize": {
           "type": "number",
           "minimum": 0,
           "multipleOf": 0.1,
-          "description": "Traffic package size in TB, required by the platform when ipv6InternetChargeType is \"ByTrafficPackage\". Must be 0 or a multiple of 0.1."
+          "description": "Traffic package size in TB, required by the platform when ipv6InternetChargeType is \"ByTrafficPackage\". 0 means unset; ByTrafficPackage needs a positive multiple of 0.1. A fraction passed with --set arrives as a string and is refused here; use --set-json."
         },
         "ipv6ClusterId": {
           "type": "string",
@@ -172,13 +170,23 @@
         },
         "manageUntaggedENI": {
           "type": "boolean",
-          "description": "Adopt secondary interfaces attached to the node that this plugin did not create and that carry no zenlayer:cni:no-manage tag. Default true. When false such interfaces are left alone but still consume the instance's interface quota."
+          "description": "Adopt secondary interfaces attached to the node that this plugin did not create and that carry no zenlayer:cni:no-manage tag. Required, no default, so a later chart cannot flip it on upgrade. false leaves such interfaces alone, though they still consume the instance's interface quota."
+        },
+        "ipamType": {
+          "enum": [
+            "direct",
+            "crd"
+          ],
+          "description": "Who calls the Zenlayer OpenAPI: direct (every node, with credentials) or crd (only the controlplane; nodes hold none). Required, no default."
         }
       },
       "additionalProperties": false
     },
     "cni": {
       "type": "object",
+      "required": [
+        "mode"
+      ],
       "properties": {
         "mode": {
           "type": "string",
@@ -193,6 +201,9 @@
     },
     "cilium": {
       "type": "object",
+      "required": [
+        "enabled"
+      ],
       "properties": {
         "enabled": {
           "type": "boolean",
@@ -200,17 +211,20 @@
         },
         "waitTimeout": {
           "type": "string",
-          "description": "How long the daemon waits for the cilium agent socket before restarting. Go duration syntax; empty keeps the 5m default."
+          "description": "How long the daemon waits for the cilium agent socket before restarting. Go duration syntax; empty, or a value that does not parse or is not positive (logged), keeps the 5m default."
         }
       },
       "additionalProperties": false
     },
     "networkPolicy": {
       "type": "object",
+      "required": [
+        "enabled"
+      ],
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Require NetworkPolicy to be enforced. Off means policy objects exist but nothing acts on them. On requires the provider to be enabled -- with cilium that means cilium.enabled=true."
+          "description": "Declares that NetworkPolicy must be enforced; on requires the provider to be enabled -- with cilium, cilium.enabled=true -- or the chart refuses to render. Off declares nothing: with cilium.enabled the Cilium agent still enforces policy."
         },
         "provider": {
           "enum": [
@@ -232,6 +246,214 @@
           "type": "object"
         }
       }
+    },
+    "controlplane": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "platformUser": {
+          "type": "string"
+        },
+        "regionID": {
+          "type": "string"
+        },
+        "identity": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "providerID": {
+              "enum": [
+                "auto",
+                "manual"
+              ]
+            }
+          }
+        },
+        "scaler": {
+          "$ref": "#/definitions/scaler"
+        },
+        "nodeGroups": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "selector",
+              "scaler"
+            ],
+            "properties": {
+              "selector": {
+                "type": "object",
+                "minProperties": 1,
+                "additionalProperties": {
+                  "type": "string"
+                }
+              },
+              "scaler": {
+                "$ref": "#/definitions/scaler"
+              }
+            }
+          }
+        },
+        "deployment": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "image": {
+              "type": "string"
+            },
+            "replicas": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "workers": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "resources": {
+              "type": "object"
+            },
+            "nodeSelector": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
     }
-  }
+  },
+  "definitions": {
+    "scaler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target"
+      ],
+      "properties": {
+        "targetMin": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "target": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "zec": {
+            "properties": {
+              "ipamType": {
+                "const": "direct"
+              }
+            },
+            "required": [
+              "ipamType"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "zec": {
+            "required": [
+              "manageUntaggedENI",
+              "secretName",
+              "securityGroupID",
+              "subnetIDs",
+              "vpcID"
+            ],
+            "properties": {
+              "vpcID": {
+                "minLength": 1
+              },
+              "securityGroupID": {
+                "minLength": 1
+              },
+              "subnetIDs": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "controlplane": {
+            "properties": {
+              "deployment": {
+                "properties": {
+                  "enabled": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "enabled"
+                ]
+              }
+            },
+            "required": [
+              "deployment"
+            ]
+          },
+          "zec": {
+            "properties": {
+              "ipamType": {
+                "const": "crd"
+              }
+            },
+            "required": [
+              "ipamType"
+            ]
+          }
+        },
+        "required": [
+          "controlplane",
+          "zec"
+        ]
+      },
+      "then": {
+        "properties": {
+          "zec": {
+            "required": [
+              "manageUntaggedENI",
+              "secretName",
+              "securityGroupID",
+              "subnetIDs",
+              "vpcID"
+            ],
+            "properties": {
+              "vpcID": {
+                "minLength": 1
+              },
+              "securityGroupID": {
+                "minLength": 1
+              },
+              "subnetIDs": {
+                "minItems": 1
+              }
+            }
+          },
+          "controlplane": {
+            "properties": {
+              "regionID": {
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

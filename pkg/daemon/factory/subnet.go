@@ -109,6 +109,21 @@ func (s *PodSubnet) EnableSubnet() {
 	s.Disable = false
 }
 
+// GetLastUpdate reports when the counts were last refreshed.
+func (s *PodSubnet) GetLastUpdate() time.Time {
+	s.RLock()
+	defer s.RUnlock()
+	return s.LastUpdate
+}
+
+// setLastUpdate records a refresh. It takes the subnet's own lock so readers
+// outside the manager (GetLastUpdate) do not race with it.
+func (s *PodSubnet) setLastUpdate(t time.Time) {
+	s.Lock()
+	defer s.Unlock()
+	s.LastUpdate = t
+}
+
 func (s *PodSubnet) GetAvailableIPv4AddressCount() int {
 	s.RLock()
 	defer s.RUnlock()
@@ -560,12 +575,12 @@ func (m *subnetManager) UpdateSubnetsStatus(options ...UpdateSubnetsStatusOption
 					// the reply may describe another vpc, or carry a cidr that will
 					// not parse.
 					sb.UpdateAvailableIpAddressCount(0)
-					sb.LastUpdate = time.Now()
+					sb.setLastUpdate(time.Now())
 					continue
 				}
 				sb.UpdateAvailableIpAddressCount(availableIPv4AddressCount)
 				sb.UpdateTopology(cidr, gateway, v6Cidr, v6Gateway, totalIPv4Cnt)
-				sb.LastUpdate = time.Now()
+				sb.setLastUpdate(time.Now())
 			}
 		}
 	}
@@ -860,4 +875,36 @@ func (m *subnetManager) inspectSubnet(subnet *zecApi.SubnetInfo) (totalIPv4Cnt, 
 		}
 	}
 	return totalIPv4Cnt, availableIPv4AddressCount, true
+}
+
+// ValidateSubnetsForStack checks that every configured subnet carries a CIDR
+// for each family ipStack serves. It runs at startup -- in the daemon for
+// direct mode, in the controlplane for crd -- because the alternative is an
+// interface created in a subnet that cannot serve the pod, which surfaces only
+// as a pool that never fills.
+func ValidateSubnetsForStack(subnets SubnetManager, ipStack types.IPStack, ids []string) error {
+	families := ipStack.Families()
+	if len(families) == 0 {
+		return fmt.Errorf("ipStack %q enables no address family", ipStack)
+	}
+	// Every mode is checked, single-family ones included, and per CIDR rather
+	// than by comparing IPStack values: a subnet with no CIDR at all reports
+	// itself as IPv4 (PodSubnet.IPStack), so on an ipv4-only node a stack
+	// comparison would find nothing wrong and the missing CIDR would surface one
+	// failed pod at a time.
+	for _, id := range ids {
+		subnet := subnets.GetPodSubnet(id)
+		if subnet == nil {
+			return fmt.Errorf("ipStack %s requires subnet %s, which could not be read", ipStack, id)
+		}
+		for _, f := range families {
+			if subnet.Cidr(f) != "" {
+				continue
+			}
+			return fmt.Errorf("ipStack %s needs every subnet to carry %s, but subnet %s has no %s cidr "+
+				"(ipv4Cidr=%q ipv6Cidr=%q) -- give it one, or set zec.ipStack to a mode it can serve",
+				ipStack, f, id, f, subnet.Cidr(zecTypes.IPFamilyV4), subnet.Cidr(zecTypes.IPFamilyV6))
+		}
+	}
+	return nil
 }

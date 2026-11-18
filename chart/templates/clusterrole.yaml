@@ -7,6 +7,12 @@ rules:
   - apiGroups: [ "" ]
     resources: [ "nodes" ]
     verbs: [ "get", "list", "watch" ]
+  # The cluster id (the kube-system namespace's uid) tagged on every interface
+  # created, so a VPC shared by several clusters is swept per cluster.
+  - apiGroups: [ "" ]
+    resources: [ "namespaces" ]
+    resourceNames: [ "kube-system" ]
+    verbs: [ "get" ]
   # Pod informer (field-selected to this node), ListLocalPods, GetPod, and the
   # annotation patch in PatchPodAnnotation.
   - apiGroups: [ "" ]
@@ -25,3 +31,11 @@ rules:
   - apiGroups: [ "" ]
     resources: [ "events" ]
     verbs: [ "create", "patch", "update" ]
+  {{- if eq .Values.zec.ipamType "crd" }}
+  # ipamType crd: the daemon writes the spec of its own ZecNode -- never
+  # status, never create or delete. The admission policy in controlplane.yaml
+  # keeps each node to the ZecNode named after it.
+  - apiGroups: [ "network.zenlayer.com" ]
+    resources: [ "zecnodes" ]
+    verbs: [ "get", "list", "watch", "patch" ]
+  {{- end }}

@@ -55,3 +55,9 @@ type EC2 interface {
 	DetachNetworkInterface(nicId string) (*zecApi.DetachNetworkInterfaceResponse, error)
 	DeleteNetworkInterface(nicId string) (*zecApi.DeleteNetworkInterfaceResponse, error)
 }
+
+// InstanceByIPDescriber is implemented by clients that can list instances by
+// address. It is not part of EC2 because only the controlplane needs it.
+type InstanceByIPDescriber interface {
+	DescribeInstancesByIPv4(ip string, pageNum int) (*zecApi.DescribeInstancesResponse, error)
+}

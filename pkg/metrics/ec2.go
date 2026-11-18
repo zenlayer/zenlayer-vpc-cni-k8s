@@ -66,11 +66,13 @@ func ZecAPIErrInc(api string, err error) {
 
 	// Also surface the error on the node, from the one place every OpenAPI error
 	// passes through: all twelve wrapper methods below call this on failure.
-	// Without a caller here the three node events RecordOpenAPIErrEvent can raise
-	// -- quota exceeded, subnet exhausted, OpenAPI throttled -- are unreachable.
+	// Without a caller here the node events RecordOpenAPIErrEvent can raise --
+	// quota exceeded, subnet exhausted, OpenAPI throttled, credential rejected,
+	// permission missing, node clock skewed, OpenAPI unreachable -- are
+	// unreachable.
 	//
 	// Safe to call on every error: it ignores anything that is not an SDK
-	// error, records only those three classes, and rate limits them itself.
+	// error, records only those classes, and rate limits them itself.
 	apiErr.RecordOpenAPIErrEvent(err, apiErr.EventInfoField{Key: "api", Value: api})
 }
 
@@ -140,6 +142,23 @@ type MetricEC2Wrapper struct {
 
 func NewMetricEC2Wrapper(p ec2.EC2) *MetricEC2Wrapper {
 	return &MetricEC2Wrapper{ec2SVC: p}
+}
+
+// DescribeInstancesByIPv4 forwards to the wrapped client when it supports the
+// lookup.
+func (m *MetricEC2Wrapper) DescribeInstancesByIPv4(ip string, pageNum int) (*zecApi.DescribeInstancesResponse, error) {
+	d, ok := m.ec2SVC.(ec2.InstanceByIPDescriber)
+	if !ok {
+		return nil, fmt.Errorf("the platform client cannot describe instances by address")
+	}
+	start := time.Now()
+	resp, err := d.DescribeInstancesByIPv4(ip, pageNum)
+	Ec2ApiReq.WithLabelValues("DescribeInstances").Inc()
+	Ec2APILatency.WithLabelValues("DescribeInstances", fmt.Sprint(err != nil), ZecReqErrCode(err)).Observe(MsSince(start))
+	if err != nil {
+		ZecAPIErrInc("DescribeInstances", err)
+	}
+	return resp, err
 }
 
 func (m *MetricEC2Wrapper) DescribeInstances(instanceIds []string) (*zecApi.DescribeInstancesResponse, error) {

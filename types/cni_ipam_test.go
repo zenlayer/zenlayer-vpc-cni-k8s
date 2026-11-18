@@ -125,3 +125,22 @@ func TestIsIPAMOnlyNilReceiver(t *testing.T) {
 		t.Error("a nil config must still default host routing on")
 	}
 }
+
+// CFG-18: as delegated IPAM the top-level keys belong to the calling plugin
+// (cilium's is "enable-debug"), so this binary's switch lives in its ipam block.
+func TestDebugSwitchFromEitherPlace(t *testing.T) {
+	for stdin, want := range map[string]bool{
+		`{"type":"zec-cni","debug":true}`:                                     true,
+		`{"type":"cilium-cni","enable-debug":true,"ipam":{"type":"zec-cni"}}`: false,
+		`{"type":"cilium-cni","ipam":{"type":"zec-cni","debug":true}}`:        true,
+		`{"type":"zec-cni"}`: false,
+	} {
+		var conf CNIConf
+		if err := json.Unmarshal([]byte(stdin), &conf); err != nil {
+			t.Fatalf("parse %s: %v", stdin, err)
+		}
+		if got := conf.DebugEnabled(); got != want {
+			t.Errorf("%s: DebugEnabled() = %v, want %v", stdin, got, want)
+		}
+	}
+}

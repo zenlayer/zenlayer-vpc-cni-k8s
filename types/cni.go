@@ -104,6 +104,15 @@ type IPAMConf struct {
 	// interface with a source address that belongs to another port's MAC, and
 	// the fabric drops it.
 	InstallHostRoutes *bool `json:"install_host_routes"`
+
+	// Debug is this binary's debug switch when it runs as delegated IPAM: the
+	// top-level keys of that entry belong to the calling plugin.
+	Debug bool `json:"debug"`
+}
+
+// DebugEnabled reports whether either debug switch is on.
+func (c *CNIConf) DebugEnabled() bool {
+	return c.Debug || c.IPAM.Debug
 }
 
 // ZecModeIPAMOnly is the only non-empty zec_mode. In this mode the binary
@@ -128,7 +137,7 @@ func (c *CNIConf) IsIPAMOnly() bool {
 	return c.IPAM.Type == pluginName && c.Type != "" && c.Type != pluginName
 }
 
-// ValidateIPAM rejects an unrecognised zec_mode rather than falling back to the
+// ValidateIPAM rejects an unrecognized zec_mode rather than falling back to the
 // full plugin path.
 //
 // Same reasoning as an unknown eniip_virtual_type: a typo that silently selects

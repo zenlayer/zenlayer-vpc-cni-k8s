@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	zecCom "github.com/zenlayer/zenlayercloud-sdk-go/zenlayercloud/common"
+
 	"github.com/zenlayer/zenlayer-vpc-cni-k8s/pkg/tracing"
 	zerrors "github.com/zenlayer/zenlayer-vpc-cni-k8s/pkg/zapi/errors"
 )
@@ -16,6 +18,7 @@ import (
 // test. The recorder is process-global, so the cleanup is mandatory.
 func captureNodeEvents(t *testing.T) *[]string {
 	t.Helper()
+	zerrors.DisableEventLimits(t)
 	var reasons []string
 	tracing.RegisterEventRecorder(func(_, reason, _ string) {
 		reasons = append(reasons, reason)
@@ -50,9 +53,50 @@ func TestRecordOpenAPIErrEventReachesWrappedErrors(t *testing.T) {
 			want: tracing.EventInsufficientIpInSubnet,
 		},
 		{
+			name: "subnet exhaustion as the create call words it",
+			err: fmt.Errorf("AllocENI: failed to create ENI: %w",
+				sdkErr(zerrors.INVALID_SUBNET_IPV4_INSUFFICIENT)),
+			want: tracing.EventInsufficientIpInSubnet,
+		},
+		{
 			name: "the older spelling of subnet exhaustion",
 			err:  fmt.Errorf("assign: %w", sdkErr(zerrors.InsufficientIpInSubnet)),
 			want: tracing.EventInsufficientIpInSubnet,
+		},
+		{
+			name: "rejected signature",
+			err:  fmt.Errorf("describe: %w", sdkErr(zerrors.AuthSignatureFailure)),
+			want: tracing.EventCredentialServiceAbnormal,
+		},
+		{
+			name: "expired signature is the clock, not the key",
+			err:  fmt.Errorf("describe: %w", sdkErr(zerrors.AuthSignatureExpired)),
+			want: tracing.EventNodeClockSkew,
+		},
+		{
+			name: "credential absent from the client",
+			err:  fmt.Errorf("describe: %w", sdkErr(zecCom.CredentialMissingError)),
+			want: tracing.EventCredentialServiceAbnormal,
+		},
+		{
+			name: "transport failure",
+			err:  fmt.Errorf("attach: %w", sdkErr(zecCom.NetworkError)),
+			want: tracing.EventOpenApiUnreachable,
+		},
+		{
+			name: "valid key without the permission",
+			err:  fmt.Errorf("assign: %w", sdkErr(zerrors.AuthUnauthorizedOperation)),
+			want: tracing.EventOpenApiPermissionDenied,
+		},
+		{
+			name: "gateway error page instead of an API answer",
+			err:  fmt.Errorf("describe: %w", sdkErr(zecCom.JsonParseError)),
+			want: tracing.EventOpenApiUnreachable,
+		},
+		{
+			name: "blocked in front of the endpoint",
+			err:  fmt.Errorf("describe: %w", sdkErr(zecCom.RequestBlockedError)),
+			want: tracing.EventOpenApiUnreachable,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

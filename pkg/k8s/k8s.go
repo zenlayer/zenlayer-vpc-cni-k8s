@@ -28,6 +28,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 
+	"github.com/zenlayer/zenlayer-vpc-cni-k8s/pkg/tracing"
 	"github.com/zenlayer/zenlayer-vpc-cni-k8s/pkg/zlog"
 	zecTypes "github.com/zenlayer/zenlayer-vpc-cni-k8s/types"
 )
@@ -42,6 +43,8 @@ const (
 	// must stay in sync with config.ZenlayerCniConfigName, which this package
 	// cannot import: pkg/daemon/config already imports pkg/k8s.
 	zenlayerCniConfigmap = "zenlayer-cni-config"
+
+	eventSourceComponent = "zenlayer-daemon"
 )
 
 var (
@@ -70,11 +73,19 @@ type K8sService interface {
 	// GetConfigMap get configmap from api server
 	GetConfigMap(ctx context.Context, namespace, name string) (*corev1.ConfigMap, error)
 
+	// GetClusterID returns ClusterID for this cluster.
+	GetClusterID(ctx context.Context) (string, error)
+
 	SetSvcCIDR(svcCidr *zecTypes.IPNetSet) error
 	GetServiceCIDR() *zecTypes.IPNetSet
 
 	// RecordNodeEvent record events of node
 	RecordNodeEvent(eventType, reason, message string)
+
+	// RecordNodeEventSync writes a node event straight to the API server and
+	// returns once it is stored. For a process about to exit: RecordNodeEvent
+	// only queues, and the queue dies with the process.
+	RecordNodeEventSync(ctx context.Context, eventType, reason, message string) error
 
 	// RecordPodEvent record events of pod
 	RecordPodEvent(podName, podNamespace, eventType, reason, message string) error
@@ -145,6 +156,21 @@ func (k *k8sManager) ListLocalPods(ctx context.Context) ([]*corev1.Pod, error) {
 	}
 
 	return podList, nil
+}
+
+func (k *k8sManager) GetClusterID(ctx context.Context) (string, error) {
+	return ClusterID(ctx, k.kubeClient)
+}
+
+// ClusterID is the uid of the kube-system namespace. It is set when the
+// cluster is built and never changes, so it tells this cluster's interfaces
+// from another's in a shared VPC with nothing to configure.
+func ClusterID(ctx context.Context, c kubernetes.Interface) (string, error) {
+	ns, err := c.CoreV1().Namespaces().Get(ctx, metav1.NamespaceSystem, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("read the kube-system namespace for the cluster id: %w", err)
+	}
+	return string(ns.UID), nil
 }
 
 func (k *k8sManager) GetPod(ctx context.Context, namespace, name string) (*corev1.Pod, error) {
@@ -265,7 +291,31 @@ func (k *k8sManager) RecordNodeEvent(eventType, reason, message string) {
 		Namespace: "",
 	}
 
-	k.recorder.Event(ref, eventType, reason, message)
+	k.recorder.Event(ref, eventType, reason, tracing.TruncateMessage(message))
+}
+
+func (k *k8sManager) RecordNodeEventSync(ctx context.Context, eventType, reason, message string) error {
+	now := metav1.Now()
+	ev := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s.%x", k.node.Name, now.UnixNano()),
+			Namespace: metav1.NamespaceDefault,
+		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind: "Node",
+			Name: k.node.Name,
+			UID:  k.node.UID,
+		},
+		Reason:         reason,
+		Message:        tracing.TruncateMessage(message),
+		Type:           eventType,
+		Source:         corev1.EventSource{Component: eventSourceComponent, Host: k.node.Name},
+		FirstTimestamp: now,
+		LastTimestamp:  now,
+		Count:          1,
+	}
+	_, err := k.kubeClient.CoreV1().Events(ev.Namespace).Create(ctx, ev, metav1.CreateOptions{})
+	return err
 }
 
 func (k *k8sManager) RecordPodEvent(podName, podNamespace, eventType, reason, message string) error {
@@ -284,7 +334,7 @@ func (k *k8sManager) RecordPodEvent(podName, podNamespace, eventType, reason, me
 		Namespace: pod.Namespace,
 	}
 
-	k.recorder.Event(ref, eventType, reason, message)
+	k.recorder.Event(ref, eventType, reason, tracing.TruncateMessage(message))
 	return nil
 }
 
@@ -391,7 +441,7 @@ func NewK8sService(ctx context.Context, nodeName string, clientSet kubernetes.In
 	}
 
 	broadcaster := record.NewBroadcaster()
-	source := corev1.EventSource{Component: "zenlayer-daemon"}
+	source := corev1.EventSource{Component: eventSourceComponent}
 	recorder := broadcaster.NewRecorder(scheme.Scheme, source)
 
 	sink := &typedv1.EventSinkImpl{

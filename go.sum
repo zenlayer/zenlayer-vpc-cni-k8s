@@ -438,8 +438,8 @@ github.com/xiang90/probing v0.0.0-20190116061207-43a291ad63a2/go.mod h1:UETIi67q
 github.com/yuin/goldmark v1.1.27/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 github.com/yuin/goldmark v1.2.1/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 github.com/yuin/goldmark v1.3.5/go.mod h1:mwnBkeHKe2W/ZEtQ+71ViKU8L12m81fl3OWwC1Zlc8k=
-github.com/zenlayer/zenlayercloud-sdk-go v0.2.52 h1:Iy9KmXz84T8pN48ZCzoAbrf8I9Jvl7t9VXSFS7wu5kg=
-github.com/zenlayer/zenlayercloud-sdk-go v0.2.52/go.mod h1:iOR3Pzb2t3Z0+UvXhdUqi7nhwZM5Ux2oH4ixKH+qe88=
+github.com/zenlayer/zenlayercloud-sdk-go v0.2.59 h1:SME1BtDbOy00MGV6CpvBwxEnF5MJoRP2XZxgNuK8pqw=
+github.com/zenlayer/zenlayercloud-sdk-go v0.2.59/go.mod h1:iOR3Pzb2t3Z0+UvXhdUqi7nhwZM5Ux2oH4ixKH+qe88=
 go.etcd.io/bbolt v1.3.2/go.mod h1:IbVyRI1SCnLcuJnV2u8VeU0CEYM7e686BmAb1XKL+uU=
 go.etcd.io/bbolt v1.5.0 h1:S7GAl7Fxv12yohbwFfIbQCGDWbQbtDGPET4P/bD4lxU=
 go.etcd.io/bbolt v1.5.0/go.mod h1:mkltfYE5aUHQxUct9N9V+Kp7aSjFqjgrhcXIS70Lrdk=

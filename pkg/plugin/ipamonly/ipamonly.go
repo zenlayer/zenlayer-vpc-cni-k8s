@@ -7,7 +7,7 @@
 //
 // It exists because the full plugin path and this one overlap only in obtaining
 // an address. From there they diverge completely: the full path builds a veth
-// pair and writes the pod's own addresses, routes and neighbours, and reports a
+// pair and writes the pod's own addresses, routes and neighbors, and reports a
 // container interface; this path reports the ENI on the host and lets the
 // calling plugin build whatever device it likes. The two also disagree on what
 // Interfaces[0] means, which is precisely the kind of overload that is cheap to
@@ -38,7 +38,7 @@ import (
 // Order matters in one place: the file lock is taken after the daemon call, not
 // around it. The lock protects only host routing state, and the caller is
 // blocked on us for the whole invocation -- holding it across a round trip to
-// the daemon would serialise pod creation behind one remote call and entangle
+// the daemon would serialize pod creation behind one remote call and entangle
 // this lock with the caller's own timeout.
 func Add(logger zlog.Logger, args *skel.CmdArgs, conf *zecTypes.CNIConf,
 	k8sConfig *zecTypes.K8SArgs) (*current.Result, error) {
