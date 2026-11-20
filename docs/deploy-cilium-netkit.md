@@ -27,7 +27,7 @@ of this project.
 | Item | Requirement | Notes |
 |---|---|---|
 | **Cilium version** | **>= v1.16** | `bpf.datapathMode` with netkit is available from 1.16. This document is written against v1.17.5 |
-| Kernel | **>= 6.7** | The minimum required by the netkit device itself; higher than the 5.4 required by chained mode |
+| Kernel | **>= 6.8** | Cilium documents netkit as available from kernel 6.8; higher than the 5.4 required by chained mode |
 | cgroup v2 | mounted | `stat -fc %T /sys/fs/cgroup` prints `cgroup2fs`. A hard prerequisite of `kubeProxyReplacement` |
 | `kubeProxyReplacement` | **must be true** | Both netkit and eBPF host-routing depend on it |
 | This plugin already running | yes | Get it working with `cni.mode=chained` first, then switch |
@@ -46,7 +46,7 @@ The reason for each parameter value is given in [§4](#4-configuration-reference
 ```bash
 # 0. Check the prerequisites
 stat -fc %T /sys/fs/cgroup                      # must be cgroup2fs
-uname -r                                        # netkit needs >= 6.7
+uname -r                                        # netkit needs >= 6.8
 kubectl -n kube-system get ds zenlayer-vpc-cni  # must be ready
 helm version --short
 # Is the cluster dual-stack? A non-zero count means step 1 needs the two keys from §4.6
@@ -81,7 +81,7 @@ kubectl -n kube-system get ds cilium -o jsonpath='{.spec.template.spec.container
 #    writing the new conflist. networkPolicy.enabled is as needed (§4.1). --reset-then-reuse-values
 #    (Helm >= 3.14): --reuse-values would also keep the old chart version's defaults
 helm upgrade zenlayer-vpc-cni \
-  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.0 \
+  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 \
   -n kube-system --reset-then-reuse-values \
   --set cni.mode=delegated --set cilium.enabled=true --set networkPolicy.enabled=true
 kubectl -n kube-system rollout restart daemonset/zenlayer-vpc-cni
@@ -387,9 +387,9 @@ use A:
   no Pod and gets no IPv6 from the plugin.
 - The release notes printed an `APISERVER:` line (view them again with
   `helm get notes zenlayer-vpc-cni -n kube-system`). This chart refuses to render without the entry
-  point. A `WARNING` there instead comes from an earlier chart, whose daemon falls back to the
-  in-cluster Service; nothing serves that Service on the node until Cilium is up, so that daemon
-  never registers.
+  point. No such line means the release is still on 1.0.0, whose daemon uses the in-cluster
+  Service; nothing serves that Service on the node until Cilium is up, so that daemon never
+  registers. Upgrade it first ([deploy-direct.md](./deploy-direct.md) §3.4).
 
 With a platform-run controlplane, the `zec.ipStack` and pod-subnet conditions above refer to the
 platform side's configuration rather than this chart's values.
@@ -437,7 +437,7 @@ interface nor kubelet; both belong to node provisioning.
 ```bash
 # ① Switch this project back to chained first
 helm upgrade zenlayer-vpc-cni \
-  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.0 \
+  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 \
   -n kube-system --reset-then-reuse-values --set cni.mode=chained
 kubectl -n kube-system rollout restart daemonset/zenlayer-vpc-cni
 

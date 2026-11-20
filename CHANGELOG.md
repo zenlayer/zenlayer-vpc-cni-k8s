@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.0.0] - 2026-11-18
+## [2.0.1] - 2026-11-20
 
 ### Added
 
@@ -160,19 +160,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `image.pullPolicy` now defaults to `IfNotPresent`. Set it to `Always` when
   re-pushing the same tag. `helm upgrade --reuse-values` keeps `Always`.
 
-- **The leaked-interface sweep keeps to its own cluster.** Every interface the
-  plugin creates carries `zenlayer:cni:cluster-id`, the uid of the cluster's
-  `kube-system` namespace. The VPC-wide sweep deletes a detached interface only
-  when that tag names this cluster or is absent; one tagged with another
-  cluster's id is left to that cluster. Absent covers interfaces created
-  before this version, which are swept as before, so an upgrade leaves no
-  interface behind -- and those a direct-mode daemon creates while it cannot
-  read the namespace (it only logs a warning), which the controlplane of any
-  crd-mode cluster in the VPC may sweep. Clusters sharing a VPC are kept apart
-  only once all of them run this version: an older one still sweeps every
-  plugin interface in the VPC. The daemon and the controlplane need `get` on
-  the `kube-system` namespace, which the chart grants; the controlplane waits
-  until it can read it.
+- **Interfaces carry the cluster they belong to.** Every interface the plugin
+  creates carries `zenlayer:cni:cluster-id`, the uid of the cluster's
+  `kube-system` namespace. In crd mode the controlplane also sweeps the whole
+  VPC for detached plugin interfaces, deleting one only when that tag names
+  this cluster or is absent; one tagged with another cluster's id is left to
+  that cluster. Interfaces without the tag -- those made by 1.0.0 (by any 1.0.0
+  cluster in the VPC), and those a direct-mode daemon creates while it cannot
+  read the namespace (it only logs a warning) -- are swept by any crd-mode
+  controlplane in the VPC once detached long enough. A direct-mode daemon, as
+  in 1.0.0, sweeps only its own instance's interfaces. The daemon and the
+  controlplane need `get` on the `kube-system` namespace, which the chart
+  grants; the controlplane waits until it can read it.
 - **An interface is swept after 10 minutes detached, not 5**, longer than the
   roughly 5.5 minutes a create may wait for its interface to attach, so a create
   still in progress is not deleted under it.
@@ -231,6 +230,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The entry said interfaces attached by an operator are left untouched. With
     1.0.0's default `manageUntaggedENI=true`, those in a configured pod subnet
     were adopted; the sentence is removed.
+  - The entry said L7 and FQDN policy are unavailable under Cilium chaining;
+    they work with Cilium's default `l7Proxy=true` and fail open only with it
+    off.
 
 ## [1.0.0] - 2026-08-28
 
@@ -421,13 +423,12 @@ chaining upstream Cilium.
   plugin's own dual-stack support does not depend on the cluster being
   dual-stack; the requirement is introduced only by layering chaining on top.
   See [docs/deploy-cilium-chained.md](docs/deploy-cilium-chained.md) §5.5 and §5.6.
-- With Cilium chaining, L7 policy (HTTP/DNS/FQDN), transparent encryption
-  (IPsec/WireGuard), and Cilium Ingress and Gateway API are not available.
-  L7 and FQDN policies fail open: the API server accepts the object, the agent
-  never loads it, and the traffic it should deny is allowed. A policy using only
-  `toFQDNs` is even reported as `Valid=True`. Express isolation with native
-  NetworkPolicy or a purely L3/L4 CiliumNetworkPolicy; see
-  [docs/deploy-cilium-chained.md](docs/deploy-cilium-chained.md) §2.
+- With Cilium chaining, transparent encryption (IPsec/WireGuard), and Cilium
+  Ingress and Gateway API are not available. L7 (HTTP/DNS) and FQDN policy
+  work with Cilium's default `l7Proxy=true`; with `l7Proxy=false` they fail
+  open: the API server accepts the object, the agent never loads it, and the
+  traffic it should deny is allowed. See
+  [docs/deploy-cilium-chained.md](docs/deploy-cilium-chained.md) §3.
 - With Cilium chaining, ClusterIP traffic **from pods** is load-balanced by
   Cilium's tc-BPF even with `kubeProxyReplacement=false`; the `KUBE-SVC-*`
   chains stay at zero packets while `cilium-dbg service list` shows the
@@ -450,5 +451,5 @@ chaining upstream Cilium.
   does not declare the `bandwidth` capability, so kubelet does not pass the
   bandwidth annotations to it.
 
-[2.0.0]: https://github.com/zenlayer/zenlayer-vpc-cni-k8s/compare/v1.0.0...v2.0.0
+[2.0.1]: https://github.com/zenlayer/zenlayer-vpc-cni-k8s/compare/v1.0.0...v2.0.1
 [1.0.0]: https://github.com/zenlayer/zenlayer-vpc-cni-k8s/releases/tag/v1.0.0

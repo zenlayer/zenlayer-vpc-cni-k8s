@@ -91,13 +91,13 @@ kubectl -n kube-system get ds cilium -o jsonpath='{.spec.template.spec.container
 # 2. 打开本项目的串接开关。daemon 会等 Cilium agent 就绪后才落盘新 conflist。
 #    用 --reset-then-reuse-values 而不是 --reuse-values：后者会沿用上一个 chart 版本的默认值
 helm upgrade zenlayer-vpc-cni \
-  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.0 \
+  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 \
   -n kube-system --reset-then-reuse-values \
   --set cilium.enabled=true --set networkPolicy.enabled=true
 kubectl -n kube-system rollout restart daemonset/zenlayer-vpc-cni
 kubectl -n kube-system rollout status daemonset/zenlayer-vpc-cni --timeout=10m
 # release 的 NOTES 列出 daemon 使用的入口（见 §4.2 的 k8sServiceHost 一行）
-helm get notes zenlayer-vpc-cni -n kube-system | grep -E '^(APISERVER|WARNING):'
+helm get notes zenlayer-vpc-cni -n kube-system | grep '^APISERVER:'
 
 # 3. 逐节点确认 conflist 已追加 cilium-cni 段（不能只查一台，期望 [zec-cni, cilium-cni]；
 #    portmap 只在不启用 Cilium 时才串接）
@@ -330,8 +330,9 @@ kubeadm join ...   # 仅当上面打印出了 KUBELET_EXTRA_ARGS 一行；
 - `zec.ipamType=crd` 且 `zec.ipStack=dual`；
 - 节点主网卡所在子网在 `zec.subnetIDs` 中（不在其中的主网卡不服务 Pod，插件也不会为它开启 IPv6）；
 - release 的 NOTES 打印的是 `APISERVER:` 一行（可用 `helm get notes zenlayer-vpc-cni -n kube-system`
-  重新查看）。本 chart 拿不到入口时会拒绝渲染；若那里显示的是 `WARNING:`，说明 release 由早先的 chart 安装：其 daemon
-  会回落到集群内 Service，而在 Cilium 启动之前，该节点上没有组件提供这个 Service，因此 daemon 永远无法注册。
+  重新查看）。本 chart 拿不到入口时会拒绝渲染；若没有这一行，说明 release 仍是 1.0.0：其 daemon
+  使用集群内 Service，而在 Cilium 启动之前，该节点上没有组件提供这个 Service，因此 daemon 永远无法注册。
+  请先升级（[deploy-direct-cn.md](./deploy-direct-cn.md) §3.4）。
 
 controlplane 由平台运行时，上述关于 `zec.ipStack` 与 Pod 子网的条件指的是平台侧的配置，而不是本 chart 的 values。
 
@@ -390,7 +391,7 @@ iptables -t nat -S | grep -c '^-N KUBE-SVC'                                # 期
 
 # ① 关掉两个开关，让 conflist 去掉 cilium-cni 段
 helm upgrade zenlayer-vpc-cni \
-  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.0 \
+  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 \
   -n kube-system --reset-then-reuse-values \
   --set cilium.enabled=false --set networkPolicy.enabled=false
 kubectl -n kube-system rollout restart daemonset/zenlayer-vpc-cni

@@ -56,7 +56,7 @@ keys as files. If the Secret has a different name, pass `--set zec.secretName=<n
 
 ```sh
 helm install zenlayer-vpc-cni \
-  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.0 \
+  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 \
   --namespace kube-system \
   --set-string zec.vpcID=<vpc-id> \
   --set-string 'zec.subnetIDs={<subnet-id-1>,<subnet-id-2>}' \
@@ -118,7 +118,7 @@ helm upgrade zenlayer-vpc-cni \
 - The behavior switches have no default in 2.x, and `--reset-then-reuse-values` keeps only the
   values that were set explicitly. Pass each switch with the value the cluster currently uses
   (the first command shows it). In 1.x, `zec.manageUntaggedENI` defaulted to `true`.
-- Starting with 2.0.0 (see `[2.0.0]` in the CHANGELOG), pod addresses
+- Starting with 2.0.1 (see `[2.0.1]` in the CHANGELOG), pod addresses
   come only from `zec.subnetIDs`. If a node's primary interface is in a subnet that is not
   listed there, that interface stops serving new pods, and the node's capacity drops by that
   interface's share (see [Checking capacity](#5-checking-capacity)). To keep the previous

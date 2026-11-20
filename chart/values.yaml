@@ -24,7 +24,7 @@
 #
 image:
   repository: "docker.io/zenlayer1/zeccni"
-  tag: "v2.0.0"
+  tag: "v2.0.1"
   pullPolicy: "IfNotPresent"
 
 zec:

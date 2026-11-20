@@ -72,7 +72,7 @@ kubectl create secret -n kube-system generic zenlayer-cni-access-key \
 
 # 2. Install. Every --set below is required; rendering fails without them.
 helm install zenlayer-vpc-cni \
-  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.0 \
+  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 \
   --namespace kube-system \
   --set zec.ipamType=crd \
   --set controlplane.deployment.enabled=true \
@@ -423,9 +423,9 @@ counters stay at zero, so inspecting kube-proxy reveals nothing.
   `--set-json` (3.10) and, for upgrades, `--reset-then-reuse-values` (3.14). In
   addition, before 3.14, `helm template` checks the chart's `kubeVersion`
   against a built-in version older than this chart accepts.
-- Linux kernel >= 6.7 on every node **when** `cni.mode=delegated` runs Cilium with
-  `bpf.datapathMode=netkit` or `netkit-l2`: netkit devices do not exist on older
-  kernels. The `chained` mode adds no kernel requirement of its own.
+- Linux kernel >= 6.8 on every node **when** `cni.mode=delegated` runs Cilium with
+  `bpf.datapathMode=netkit` or `netkit-l2`: Cilium documents netkit as available
+  from kernel 6.8. The `chained` mode adds no kernel requirement of its own.
 - kube-proxy, or another component that provides Service handling. Under
   `cni.mode=delegated`, that component is Cilium, and its `kubeProxyReplacement`
   is mandatory in that mode.
@@ -464,7 +464,7 @@ nodes mount no credentials at all. If the Secret has a different name, pass
 
 ```sh
 helm install zenlayer-vpc-cni \
-  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.0 \
+  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 \
   --namespace kube-system \
   --set zec.ipamType=crd \
   --set controlplane.deployment.enabled=true \
@@ -504,11 +504,15 @@ helm install zenlayer-vpc-cni \
   from the new chart. `--reuse-values` also keeps the old chart's defaults, so
   new keys are missing and the image is never upgraded. A values file kept in
   version control also works. (With `platformUser`, `zec.manageUntaggedENI` is
-  configured on the platform side and is not passed.)
+  configured on the platform side and is not passed.) A release installed with
+  1.0.0 set these switches through that chart's defaults, so no reuse flag
+  carries the right values forward: to upgrade from 1.0.0, follow
+  [docs/deploy-direct.md](docs/deploy-direct.md) §3.4.
 - The `ZecNode` CRD is in the chart's `crds/` directory, which Helm installs
   on the **first install only** and never upgrades. Before upgrading the chart,
   apply the new CRD manually:
-  `kubectl apply --server-side -f <chart directory>/crds/zecnodes.yaml`.
+  `helm pull oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 --untar`,
+  then `kubectl apply --server-side -f zenlayer-vpc-cni/crds/zecnodes.yaml`.
 - The controlplane runs from its own image, `<image.repository>-controlplane`,
   with the same tag; the node image does not contain it. A registry mirror or an
   offline install requires both images.
@@ -534,7 +538,7 @@ chart assumes a cluster older than 1.30 and refuses to render.
 
 ```sh
 helm template zenlayer-vpc-cni \
-  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.0 \
+  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 \
   --kube-version 1.30.0 \
   --api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy \
   --set zec.ipamType=crd \
@@ -747,7 +751,7 @@ neither what the controlplane reads nor the "DaemonSet itself" row; see below.
 | Value | Default | Description |
 | --- | --- | --- |
 | `image.repository` | `docker.io/zenlayer1/zeccni` | Image for the init container and `zec-ipam`. The controlplane's image is this name with `-controlplane` appended, with the same tag. |
-| `image.tag` | `v2.0.0` | Image tag of both images. |
+| `image.tag` | `v2.0.1` | Image tag of both images. |
 | `image.pullPolicy` | `IfNotPresent` | Image pull policy. |
 | `zec.vpcID` | `""` | **Required** with `controlplane.deployment.enabled` (and in direct mode); unused with `controlplane.platformUser`. Zenlayer VPC ID. All subnets must belong to this VPC. |
 | `zec.subnetIDs` | `[]` | **Required** under the same conditions as `zec.vpcID`. The only subnets that Pod IPs come from; interfaces that the plugin creates are placed in them. A node's primary interface serves Pods only when its subnet is listed. Otherwise, the node holds fewer Pods by that interface's share, and a node where no other interface can serve Pods holds none (in crd mode, `NoPodInterface`). On upgrade, existing nodes whose primary subnet is not listed lose that share as the Pods holding addresses there terminate, and those addresses are released with them; see [Capacity planning](#capacity-planning) for idle addresses. At most 5, all in the same VPC. |
@@ -1083,7 +1087,7 @@ kubectl -n kube-system logs deploy/zenlayer-vpc-cni-controlplane
 | `waiting for OpenAPI credentials` | The Secret is mounted but its keys cannot be read: they are not `AccessKeyID` / `AccessKeyPassword`, or one is empty. For a temporary credential (a `SecurityToken` key is present): `AccessKeySecret`, `SecurityToken` or `Expiration` is missing or empty, or `Expiration` is not an RFC 3339 time. |
 | `waiting for the cluster id` | The `kube-system` namespace, whose UID tags the interfaces that this cluster creates, cannot be read: RBAC is missing or the API server is unreachable. |
 | `waiting for the pod subnets` | The subnet lookup failed: the OpenAPI rejected the credential or cannot be reached, a subnet does not exist or is not in `zec.vpcID`, or `zec.ipStack=dual` is set and a subnet has no IPv6 CIDR. The log states the exact cause. |
-| `waiting for the ZecNode CRD` | The CRD is not installed. Install it with `kubectl apply --server-side -f <chart directory>/crds/zecnodes.yaml`. |
+| `waiting for the ZecNode CRD` | The CRD is not installed. Install it with `kubectl apply --server-side -f zenlayer-vpc-cni/crds/zecnodes.yaml` from the chart (`helm pull oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 --untar`). |
 | `credential invalid` / `openapi unreachable` / `clock skew: request signatures rejected` | A cluster-wide failure while running: the credential was rejected, the OpenAPI cannot be reached, or the clock on the controlplane's node is too far off. Also shown in every `ZecNode`'s `ALLOCATION` column and in Node events. |
 
 Invalid IPv6 billing values (such as `ByTrafficPackage` without

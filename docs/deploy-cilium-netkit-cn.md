@@ -24,7 +24,7 @@ IP 分配、ENI 生命周期、温池与 GC 均保持不变，仍由本项目负
 | 项 | 要求 | 备注 |
 |---|---|---|
 | **Cilium 版本** | **≥ v1.16** | netkit 的 `bpf.datapathMode` 从 1.16 起提供；本文基于 v1.17.5 编写 |
-| 内核 | **≥ 6.7** | netkit 设备本身的最低要求，高于串接模式要求的 5.4 |
+| 内核 | **≥ 6.8** | Cilium 文档规定 netkit 从内核 6.8 起可用，高于串接模式要求的 5.4 |
 | cgroup v2 | 挂载 | `stat -fc %T /sys/fs/cgroup` 输出 `cgroup2fs`；这是 `kubeProxyReplacement` 的硬前提 |
 | `kubeProxyReplacement` | **必须为 true** | netkit 与 eBPF host-routing 都以它为前提 |
 | 本项目已正常运行 | 是 | 先以 `cni.mode=chained` 运行正常，再切换 |
@@ -42,7 +42,7 @@ Pod 保留创建时的设备，直到被重建。因此在工作负载完成滚�
 ```bash
 # 0. 前提自检
 stat -fc %T /sys/fs/cgroup                      # 必须是 cgroup2fs
-uname -r                                        # netkit 需要 >= 6.7
+uname -r                                        # netkit 需要 >= 6.8
 kubectl -n kube-system get ds zenlayer-vpc-cni  # 必须已就绪
 helm version --short
 # 集群是不是双栈 —— 输出非 0 时第 1 步要加 §4.6 的两个键
@@ -75,7 +75,7 @@ kubectl -n kube-system get ds cilium -o jsonpath='{.spec.template.spec.container
 #    networkPolicy.enabled 按需（§4.1）。用 --reset-then-reuse-values（Helm ≥ 3.14）：
 #    --reuse-values 会连旧 chart 版本的默认值一起沿用
 helm upgrade zenlayer-vpc-cni \
-  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.0 \
+  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 \
   -n kube-system --reset-then-reuse-values \
   --set cni.mode=delegated --set cilium.enabled=true --set networkPolicy.enabled=true
 kubectl -n kube-system rollout restart daemonset/zenlayer-vpc-cni
@@ -359,8 +359,9 @@ kubeadm join ...   # 仅当上面打印出了 KUBELET_EXTRA_ARGS 一行；
 - `zec.ipamType=crd` 且 `zec.ipStack=dual`。
 - 节点主网卡所在子网在 `zec.subnetIDs` 中；不在其中的主网卡不服务 Pod，插件也不会为它开启 IPv6。
 - release 的 NOTES 中打印的是 `APISERVER:` 一行（可用 `helm get notes zenlayer-vpc-cni -n kube-system`
-  重新查看）。本 chart 拿不到入口时会拒绝渲染；若该处是 `WARNING`，说明是由早先的 chart 安装的：其 daemon
-  会回落到集群内 Service，而在 Cilium 启动之前该节点上没有任何组件提供该 Service，因此 daemon 永远无法注册。
+  重新查看）。本 chart 拿不到入口时会拒绝渲染；若没有这一行，说明 release 仍是 1.0.0：其 daemon
+  使用集群内 Service，而在 Cilium 启动之前该节点上没有任何组件提供该 Service，因此 daemon 永远无法注册。
+  请先升级（[deploy-direct-cn.md](./deploy-direct-cn.md) §3.4）。
 
 controlplane 由平台运行时，上面关于 `zec.ipStack` 与 Pod 子网的条件，指的是平台侧的配置，而不是本 chart 的 values。
 
@@ -405,7 +406,7 @@ kubectl -n kube-system delete pod -l k8s-app=cilium --field-selector spec.nodeNa
 ```bash
 # ① 先把本项目切回 chained
 helm upgrade zenlayer-vpc-cni \
-  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.0 \
+  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 \
   -n kube-system --reset-then-reuse-values --set cni.mode=chained
 kubectl -n kube-system rollout restart daemonset/zenlayer-vpc-cni
 

@@ -103,13 +103,13 @@ kubectl -n kube-system get ds cilium -o jsonpath='{.spec.template.spec.container
 #    before writing the new conflist. --reset-then-reuse-values, not --reuse-values: the latter
 #    keeps the previous chart version's defaults
 helm upgrade zenlayer-vpc-cni \
-  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.0 \
+  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 \
   -n kube-system --reset-then-reuse-values \
   --set cilium.enabled=true --set networkPolicy.enabled=true
 kubectl -n kube-system rollout restart daemonset/zenlayer-vpc-cni
 kubectl -n kube-system rollout status daemonset/zenlayer-vpc-cni --timeout=10m
 # The release notes show the entry point the daemon uses (k8sServiceHost row in §4.2)
-helm get notes zenlayer-vpc-cni -n kube-system | grep -E '^(APISERVER|WARNING):'
+helm get notes zenlayer-vpc-cni -n kube-system | grep '^APISERVER:'
 
 # 3. Confirm on every node that the conflist now carries the cilium-cni section -- do not check
 #    just one. Expect [zec-cni, cilium-cni] -- portmap is only chained when Cilium is off
@@ -370,9 +370,9 @@ hold; otherwise, use A:
   serves no Pod and gets no IPv6 from the plugin);
 - the release notes printed an `APISERVER:` line (read them again with
   `helm get notes zenlayer-vpc-cni -n kube-system`). This chart refuses to render without the entry
-  point. A `WARNING:` line there instead comes from an earlier chart: its daemon falls back to the
-  in-cluster Service, which nothing serves on that node until Cilium is up, and therefore never
-  registers.
+  point. No such line means the release is still on 1.0.0: its daemon uses the in-cluster Service,
+  which nothing serves on that node until Cilium is up, and therefore never registers. Upgrade it
+  first ([deploy-direct.md](./deploy-direct.md) §3.4).
 
 When the controlplane is run by the platform, the `zec.ipStack` and pod-subnet conditions above
 refer to the platform side's configuration rather than this chart's values.
@@ -437,7 +437,7 @@ iptables -t nat -S | grep -c '^-N KUBE-SVC'                                # exp
 
 # ① Turn both switches off so the conflist drops the cilium-cni section
 helm upgrade zenlayer-vpc-cni \
-  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.0 \
+  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 \
   -n kube-system --reset-then-reuse-values \
   --set cilium.enabled=false --set networkPolicy.enabled=false
 kubectl -n kube-system rollout restart daemonset/zenlayer-vpc-cni

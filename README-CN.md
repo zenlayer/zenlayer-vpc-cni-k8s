@@ -67,7 +67,7 @@ kubectl create secret -n kube-system generic zenlayer-cni-access-key \
 
 # 2. 安装。下面每个 --set 都是必填的，缺少任意一个都会导致渲染失败。
 helm install zenlayer-vpc-cni \
-  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.0 \
+  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 \
   --namespace kube-system \
   --set zec.ipamType=crd \
   --set controlplane.deployment.enabled=true \
@@ -326,7 +326,7 @@ tc/tcx BPF 程序是 BPF link，**不会随 agent 卸载而消失，`helm uninst
   `--reset-then-reuse-values`（3.14）；此外，3.14 之前的 `helm template` 会使用内置的、低于本 chart 要求的
   Kubernetes 版本来核对 `kubeVersion`。
 - 当 `cni.mode=delegated` 且 Cilium 使用 `bpf.datapathMode=netkit` 或 `netkit-l2` 时，
-  每个节点的 Linux 内核须 >= 6.7：低于该版本没有 netkit 设备。
+  每个节点的 Linux 内核须 >= 6.8：Cilium 文档规定 netkit 从内核 6.8 起可用。
   `chained` 模式不额外引入内核要求。
 - kube-proxy，或其他提供 Service 处理能力的组件。在 `cni.mode=delegated` 下该组件即为
   Cilium，其 `kubeProxyReplacement` 在该模式下是必选项。
@@ -359,7 +359,7 @@ controlplane 也接受放在同一目录中的临时（STS）凭证：键为 `Ac
 
 ```sh
 helm install zenlayer-vpc-cni \
-  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.0 \
+  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 \
   --namespace kube-system \
   --set zec.ipamType=crd \
   --set controlplane.deployment.enabled=true \
@@ -390,9 +390,12 @@ helm install zenlayer-vpc-cni \
   `--reset-then-reuse-values`（Helm ≥ 3.14），或者使用纳入版本管理的 values 文件。不要使用
   `--reuse-values`：它会连同上一个 chart 的默认值一起沿用，跨 chart 版本升级时新增的 key 会缺失，
   `image.tag` 也会停留在旧版本。（使用 `platformUser` 时，`zec.manageUntaggedENI` 由平台侧配置，无需传入。）
+  用 1.0.0 安装的 release，这些开关取的是当时 chart 的默认值，任何 reuse 参数都无法正确带过来：
+  从 1.0.0 升级请按 [docs/deploy-direct-cn.md](docs/deploy-direct-cn.md) §3.4 操作。
 - `ZecNode` CRD 位于 chart 的 `crds/` 目录，helm 只在**首次安装**时安装它，升级时不会更新。
   升级 chart 前，请先手动应用新版 CRD：
-  `kubectl apply --server-side -f <chart 目录>/crds/zecnodes.yaml`。
+  `helm pull oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 --untar`，
+  然后执行 `kubectl apply --server-side -f zenlayer-vpc-cni/crds/zecnodes.yaml`。
 - controlplane 使用独立的镜像 `<image.repository>-controlplane`（tag 相同），节点镜像中不包含它。
   使用镜像仓库代理或离线安装时，需要准备这两个镜像。
 
@@ -413,7 +416,7 @@ helm install zenlayer-vpc-cni \
 
 ```sh
 helm template zenlayer-vpc-cni \
-  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.0 \
+  oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 \
   --kube-version 1.30.0 \
   --api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy \
   --set zec.ipamType=crd \
@@ -580,7 +583,7 @@ daemon 在分配地址前会先比较本节点已记录的 Pod 数与容量上�
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `image.repository` | `docker.io/zenlayer1/zeccni` | init 容器与 `zec-ipam` 的镜像。controlplane 的镜像是这个名字加 `-controlplane`，tag 相同。 |
-| `image.tag` | `v2.0.0` | 镜像 tag，两个镜像共用。 |
+| `image.tag` | `v2.0.1` | 镜像 tag，两个镜像共用。 |
 | `image.pullPolicy` | `IfNotPresent` | 镜像拉取策略。 |
 | `zec.vpcID` | `""` | `controlplane.deployment.enabled` 时**必填**（direct 模式同样必填）；使用 `controlplane.platformUser` 时不生效。Zenlayer VPC ID。所有子网都必须属于它。 |
 | `zec.subnetIDs` | `[]` | 必填条件同 `zec.vpcID`。Pod IP 只来自这些子网，插件新建的网卡也创建在这些子网中。节点主网卡所在子网在其中时，主网卡也参与分配；否则不参与，节点可放置的 Pod 数会减少主网卡对应的那一份（参见[容量规划](#容量规划)）。从旧版本升级时，主网卡子网不在列表中的存量节点会减少这一份容量，随主网卡上的 Pod 退出而逐步生效（地址随 Pod 一起释放；空闲地址的处理参见[容量规划](#容量规划)）。没有其他网卡能够服务 Pod 时，节点将无法放置任何 Pod（crd 模式下 `ALLOCATION` 为 `NoPodInterface`）。最多 5 个，且须位于同一个 VPC 中。 |
@@ -847,7 +850,7 @@ kubectl -n kube-system logs deploy/zenlayer-vpc-cni-controlplane
 | `waiting for OpenAPI credentials` | Secret 已挂载，但无法读取其中的键：键不是 `AccessKeyID` / `AccessKeyPassword`，或值为空。对临时凭证（存在 `SecurityToken` 键）：`AccessKeySecret`、`SecurityToken` 或 `Expiration` 缺失或为空，或 `Expiration` 不是 RFC 3339 格式。 |
 | `waiting for the pod subnets` | 查询子网失败：OpenAPI 拒绝了凭证或无法访问、子网不存在或不属于 `zec.vpcID`，或 `zec.ipStack=dual` 而某个子网没有 IPv6 CIDR。日志中给出具体原因。 |
 | `waiting for the cluster id` | 无法读取 `kube-system` 命名空间（使用其 UID 作为集群 id）：RBAC 缺失或 apiserver 不可达。 |
-| `waiting for the ZecNode CRD` | CRD 未安装。请使用 `kubectl apply --server-side -f <chart 目录>/crds/zecnodes.yaml` 安装。 |
+| `waiting for the ZecNode CRD` | CRD 未安装。请从 chart 中安装：`helm pull oci://registry-1.docker.io/zenlayer1/zenlayer-vpc-cni --version 2.0.1 --untar`，然后执行 `kubectl apply --server-side -f zenlayer-vpc-cni/crds/zecnodes.yaml`。 |
 | `credential invalid` / `openapi unreachable` / `clock skew: request signatures rejected` | 运行中出现的全局故障：凭证被拒、无法访问 OpenAPI、controlplane 所在节点时钟偏差过大。同时记录在各节点 `ZecNode` 的 `ALLOCATION` 列和 Node 事件中。 |
 
 IPv6 计费参数不合法（如 `ByTrafficPackage` 缺少 `ipv6PackageSize`）时，controlplane 启动后立即退出，
