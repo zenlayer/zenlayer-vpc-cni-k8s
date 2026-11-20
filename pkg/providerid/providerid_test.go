@@ -19,7 +19,7 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
-// Nodes 2.0.0 already wrote keep being read; the field cannot be changed.
+// Nodes already written in the older form keep being read; the field cannot be changed.
 func TestParseLegacy(t *testing.T) {
 	region, id, err := Parse("zenlayer://1755516676029420392")
 	if err != nil || region != "" || id != "1755516676029420392" {

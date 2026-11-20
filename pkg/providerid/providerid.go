@@ -30,7 +30,7 @@ func Format(regionID, instanceID string) string {
 // Parse returns the region and instance IDs in providerID. It rejects
 // anything but the exact form Format writes, so a value set by hand in another
 // shape is reported rather than guessed at -- with one exception:
-// zenlayer://<instanceId>, which 2.0.0 wrote before the format was aligned with
+// zenlayer://<instanceId>, the older form written before the format was aligned with
 // the cloud controller manager. Such a node cannot be rewritten, so it is still
 // read; regionID is empty then.
 func Parse(providerID string) (regionID, instanceID string, err error) {

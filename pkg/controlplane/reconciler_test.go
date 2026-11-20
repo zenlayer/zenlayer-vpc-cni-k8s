@@ -521,7 +521,7 @@ func TestVerifyByAddressFiltersExactly(t *testing.T) {
 }
 
 // A node verifies by the providerID the cloud controller manager writes, and
-// by the 2.0.0 form that names no region, which cannot be rewritten.
+// by the older form that names no region, which cannot be rewritten.
 func TestVerifyByProviderID(t *testing.T) {
 	cfg := &Config{VpcID: "vpc-1", Identity: IdentityConfig{ProviderID: IdentityAuto}}
 	for _, pid := range []string{"zenlayer:///asia-east-1/i-1", "zenlayer://i-1"} {

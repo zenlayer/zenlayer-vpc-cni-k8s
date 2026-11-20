@@ -91,7 +91,7 @@ func verifyIdentity(api instanceLookup, cfg *Config, node *corev1.Node, claim v1
 
 	id := &identity{}
 	// claimedRegion is the region providerID names; empty when it names none
-	// (found by address, or written in the 2.0.0 form without a region).
+	// (found by address, or written in the older form without a region).
 	var claimedRegion string
 	switch {
 	case node.Spec.ProviderID != "":

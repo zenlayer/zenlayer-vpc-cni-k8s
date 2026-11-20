@@ -106,7 +106,7 @@ helm upgrade zenlayer-vpc-cni \
   若 1.x 安装时显式固定了 `image.tag`，还需加上 `--set image.tag=<new-tag>`，否则结果与上一条相同。
 - 2.x 的行为开关没有默认值，而 `--reset-then-reuse-values` 只保留显式设置过的值。请按集群当前的
   取值（可通过第一条命令查到）逐个传入；1.x 中 `zec.manageUntaggedENI` 的默认值为 `true`。
-- 自 2.0.0 之后的版本起（见 CHANGELOG 的 `[Unreleased]`），Pod 地址只来自 `zec.subnetIDs`。
+- 自 2.0.0 起（见 CHANGELOG 的 `[2.0.0]`），Pod 地址只来自 `zec.subnetIDs`。
   若节点主网卡所在子网不在其中，该主网卡将不再服务新 Pod，节点容量也会相应扣除这块网卡的份额
   （见[容量核对](#5-容量核对)）。如需保持原有容量，请将节点子网也列入 `zec.subnetIDs`。
 - 当 `cilium.enabled=true` 且 `zec.k8sServiceHost` 留空时，2.x chart 会在升级时从

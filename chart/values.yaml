@@ -281,7 +281,7 @@ controlplane:
     # write providerID (zenlayer:///<regionId>/<instanceId>, the form
     # zenlayer-cloud-controller-manager writes) -- once: the apiserver never
     # lets it change. manual: never write it; serve only Nodes whose
-    # providerID is already set, in that form or 2.0.0's zenlayer://<instanceId>.
+    # providerID is already set, in that form or the older zenlayer://<instanceId>.
     providerID: "auto"
   # Warm-pool sizing handed to every node through its ZecNode: how many idle
   # addresses each node keeps ready. A change takes effect without restarting

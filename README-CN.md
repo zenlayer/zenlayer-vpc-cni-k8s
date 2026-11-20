@@ -592,7 +592,7 @@ daemon 在分配地址前会先比较本节点已记录的 Pod 数与容量上�
 | `controlplane.scaler.target` | `2` | 每个节点 warm（预分配、未使用）IP 的目标数量。必须 >= 1。 |
 | `controlplane.scaler.targetMin` | `1` | 池的总量下限（含已被 Pod 占用的地址），并非仅指空闲部分。池的上限是节点容量，没有单独的配置。 |
 | `controlplane.nodeGroups` | `[]` | 按节点标签分组设置温池大小，第一个 `selector` 匹配的组生效，例如 `[{selector: {pool: large}, scaler: {targetMin: 10, target: 20}}]`。 |
-| `controlplane.identity.providerID` | `auto` | `auto`：Node 没有 `spec.providerID` 时，controlplane 按 Node 的 InternalIP 找到实例，并与 daemon 从 DMI 读取的实例号核对后，补写 `zenlayer:///<regionId>/<instanceId>`，与 zenlayer-cloud-controller-manager 写入的格式相同（只写一次，API server 不允许再修改）。`manual`：从不写入，只服务已按该格式（或 2.0.0 写入的 `zenlayer://<instanceId>`）设置了 providerID 的节点。 |
+| `controlplane.identity.providerID` | `auto` | `auto`：Node 没有 `spec.providerID` 时，controlplane 按 Node 的 InternalIP 找到实例，并与 daemon 从 DMI 读取的实例号核对后，补写 `zenlayer:///<regionId>/<instanceId>`，与 zenlayer-cloud-controller-manager 写入的格式相同（只写一次，API server 不允许再修改）。`manual`：从不写入，只服务已按该格式（或旧格式 `zenlayer://<instanceId>`）设置了 providerID 的节点。 |
 | `controlplane.deployment.image` | `""` | 留空即为 `<image.repository>-controlplane:<image.tag>`。controlplane 以非特权用户（65534）运行，通过所属组读取 Secret（权限 0440，`fsGroup`），因此此处指定的镜像也必须以该用户运行。 |
 | `controlplane.deployment.nodeSelector` | `{}` | controlplane 必须运行在哪些节点上。留空：任意节点，优先选择带 `node-role.kubernetes.io/control-plane` 标签的节点，因为 controlplane 挂载凭证，而 worker 上运行的是租户负载。controlplane 所在的节点需要公网出向。 |
 | `controlplane.deployment.replicas` | `1` | controlplane 副本数，通过 Lease 选主，同一时刻只有一个副本在工作。多一个副本可以更快接管；滚动升级到一个始终无法启动的配置时，另一个副本仍在工作（只有一个副本时，旧 Pod 会先被删除）。health 端口是 host 端口，每个节点最多运行一个副本：副本数不能超过可运行它的节点数。 |
